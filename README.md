@@ -4,7 +4,7 @@ Do you have a large folder of memes you want to search semantically? Do you have
 
 ## Features
 
-They say a picture is worth a thousand words. Unfortunately, not all (most?) sets of words can be adequately described by pictures. Regardless, here is a picture. You can use a running instance [here](https://mse.osmarks.net/).
+They say a picture is worth a thousand words. Unfortunately, many (most?) sets of words cannot be adequately described by pictures. Regardless, here is a picture. You can use a running instance [here](https://mse.osmarks.net/).
 
 ![Meme Search Engine's frontend.](/demo-image.png)
 
