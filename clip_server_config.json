@@ -1,0 +1,7 @@
+{
+    "device": "cuda:0",
+    "model": "ViT-H-14",
+    "model_name": "openclip-ViT-H-14",
+    "max_batch_size": 128,
+    "port": 1708
+}

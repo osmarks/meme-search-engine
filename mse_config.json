@@ -1,0 +1,6 @@
+{
+    "clip_server": "http://localhost:1708/",
+    "db_path": "/srv/mse/data.sqlite3",
+    "port": 1707,
+    "files": "/data/public/memes-or-something/"
+}
