@@ -25,7 +25,7 @@ They say a picture is worth a thousand words. Unfortunately, many (most?) sets o
         * `model_name` is the name of the model for metrics purposes.
         * `max_batch_size` controls the maximum allowed batch size. Higher values generally result in somewhat better performance (the bottleneck in most cases is elsewhere right now though) at the cost of higher VRAM use.
         * `port` is the port to run the HTTP server on.
-* Run `mse.py` (also as a background service)
+* Run `mse.py` (also as a background service).
     * This needs to be exposed somewhere the frontend can reach it. Configure your reverse proxy appropriately.
     * It has a JSON config file as well.
         * `clip_server` is the full URL for the backend server.
