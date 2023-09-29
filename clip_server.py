@@ -88,9 +88,9 @@ async def run_inference(request):
     event = asyncio.Event()
     results = None
     def callback(*argv):
-        loop.call_soon_threadsafe(lambda: event.set())
         nonlocal results
         results = argv
+        loop.call_soon_threadsafe(lambda: event.set())
     pq.put_nowait(InferenceParameters(data.get("text"), data.get("images"), callback))
     await event.wait()
     body_data = results[1]
