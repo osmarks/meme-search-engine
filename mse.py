@@ -11,6 +11,7 @@ import numpy
 import os
 import aiohttp_cors
 import json
+import io
 import sys
 
 with open(sys.argv[1], "r") as config_file:
@@ -118,9 +119,10 @@ class Index:
                             st = os.stat(path)
                             if st.st_mtime != files.get(file):
                                 try:
-                                    im = Image.open(path).resize(self.inference_server_config["image_size"]).convert("RGB")
+                                    im = Image.open(path)
+                                    im.draft("RGB", self.inference_server_config["image_size"])
                                     buf = io.BytesIO()
-                                    im.save(buf, format="BMP")
+                                    im.resize(self.inference_server_config["image_size"]).convert("RGB").save(buf, format="BMP")
                                     b = buf.getvalue()
                                 except Exception as e:
                                     print(file, "failed", e)
