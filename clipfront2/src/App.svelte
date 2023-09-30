@@ -120,8 +120,8 @@
     let queryTerms = []
 
     const focusEl = el => el.focus()
-    const newTextQuery = (content="") => {
-        queryTerms.push({ type: "text", weight: 1, sign: "+", text: content })
+    const newTextQuery = (content=null) => {
+        queryTerms.push({ type: "text", weight: 1, sign: "+", text: typeof content === "string" ? content : "" })
         queryTerms = queryTerms
     }
     const removeTerm = term => {
