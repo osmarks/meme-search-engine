@@ -86,7 +86,7 @@
         {/each}
     </ul>
     <div class="ctrlbar">
-        <input type="search" placeholder="Text Query" bind:value={query} on:keydown={handleKey} on:focus={newTextQuery}>
+        <input type="search" placeholder="Text Query" on:keydown={handleKey} on:focus={newTextQuery}>
         <button on:click={pickFile}>Image Query</button>
         <button on:click={runSearch} style="margin-left: auto">Search</button>
     </div>
@@ -120,8 +120,8 @@
     let queryTerms = []
 
     const focusEl = el => el.focus()
-    const newTextQuery = () => {
-        queryTerms.push({ type: "text", weight: 1, sign: "+", text: "" })
+    const newTextQuery = (content="") => {
+        queryTerms.push({ type: "text", weight: 1, sign: "+", text: content })
         queryTerms = queryTerms
     }
     const removeTerm = term => {
@@ -149,7 +149,6 @@
     let resultPromise
     let results
     let displayedResults = []
-    let query = ""
     const runSearch = async () => {
         if (!resultPromise) {
             let args = {}
@@ -213,5 +212,11 @@
         console.log("redraw")
         pendingImageLoads -= 1
         redrawGrid()
+    }
+
+    const queryStringParams = new URLSearchParams(window.location.search)
+    if (queryStringParams.get("q")) {
+        newTextQuery(queryStringParams.get("q"))
+        runSearch()
     }
 </script>
