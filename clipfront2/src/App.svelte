@@ -67,6 +67,16 @@
 </style>
 
 <h1>Meme Search Engine</h1>
+<details>
+    <summary>Usage tips</summary>
+    <ul>
+        <li>This uses CLIP-like image/text embedding models. In general, search by thinking of what caption your desired image might be given by random people on the internet.</li>
+        <li>The model can read text, but not all of it.</li>
+        <li>In certain circumstances, it may be useful to postfix your query with "meme".</li>
+        <li>Capitalization is ignored.</li>
+        <li>Only English is supported. Other languages might work slightly.</li>
+    </ul>
+</details>
 <div class="controls">
     <ul>
         {#each queryTerms as term}

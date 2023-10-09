@@ -1,4 +1,3 @@
-open_clip_torch==2.20.0
 Pillow==10.0.1
 prometheus-client==0.17.1
 u-msgpack-python==2.8.0
