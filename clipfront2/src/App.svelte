@@ -112,7 +112,17 @@
     <Masonry bind:refreshLayout={refreshLayout} colWidth="minmax(Min(20em, 100%), 1fr)" items={displayedResults}>
         {#each displayedResults as result}
             {#key result.file}
-                <div class="result"><a href={util.getURL(result.file)}><img src={util.getURL(result.file)} on:load={updateCounter} on:error={updateCounter} alt={result.caption || result.file}></a></div>
+                <div class="result">
+                    <a href={util.getURL(result.file)}>
+                        <picture>
+                            {#if util.hasThumbnails(result.file)}
+                                <source srcset={util.thumbnailPath(result.file, "avif-lq") + ", " + util.thumbnailPath(result.file, "avif-hq") + " 2x"} type="image/avif" />
+                                <source srcset={util.thumbnailPath(result.file, "jpeg-800") + " 800w, " + util.thumbnailPath(result.file, "jpeg-fullscale")} type="image/jpeg" />
+                            {/if}
+                            <img src={util.getURL(result.file)} on:load={updateCounter} on:error={updateCounter} alt={result.caption || result.file}>
+                        </picture>
+                    </a>
+                </div>
             {/key}
         {/each}
     </Masonry>

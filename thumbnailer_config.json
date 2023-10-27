@@ -1,0 +1,5 @@
+{
+    "database": "/srv/mse/thumb.sqlite3",
+    "input": "/data/public",
+    "output": "/data/public/thumbs"
+}

@@ -1,4 +1,5 @@
 {
     "backend_url": "https://mse.osmarks.net/backend",
-    "image_path": "https://i2.osmarks.net/memes-or-something/"
+    "image_path": "https://i2.osmarks.net/memes-or-something/",
+    "thumb_path": "https://i2.osmarks.net/thumbs/memes-or-something_"
 }

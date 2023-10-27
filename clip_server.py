@@ -54,13 +54,16 @@ def do_inference(params: InferenceParameters):
                 items_ctr.labels(MODELNAME, "text").inc(text.shape[0])
                 with inference_time_hist.labels(MODELNAME + "-text", text.shape[0]).time():
                     features = model.text_model.forward(input_ids=torch.tensor(text, device=DEVICE)).pooler_output
+                    features /= features.norm(dim=-1, keepdim=True)
+                    features = features.cpu().numpy()
             elif images is not None:
                 items_ctr.labels(MODELNAME, "image").inc(images.shape[0])
                 with inference_time_hist.labels(MODELNAME + "-image", images.shape[0]).time():
                     features = model.vision_model.forward(torch.tensor(images, device=DEVICE)).pooler_output
-            features /= features.norm(dim=-1, keepdim=True)
+                    features /= features.norm(dim=-1, keepdim=True)
+                    features = features.cpu().numpy()
             batch_count_ctr.labels(MODELNAME).inc()
-            callback(True, features.cpu().numpy())
+            callback(True, features)
         except Exception as e:
             traceback.print_exc()
             callback(False, str(e))
@@ -77,8 +80,7 @@ def preprocessing_thread():
         try:
             if text:
                 assert len(text) <= BS, f"max batch size is {BS}"
-                # I feel like this ought to be batchable but I can't see how to do that
-                text = numpy.array(tokenizer(text, padding="max_length", truncation=True)["input_ids"])
+                text = numpy.array(tokenizer([ t.lower() for t in text ], padding="max_length", truncation=True)["input_ids"])
             elif images:
                 assert len(images) <= BS, f"max batch size is {BS}"
                 images = numpy.array(image_processor([ Image.open(io.BytesIO(bs)) for bs in images ])["pixel_values"]).astype("float16")

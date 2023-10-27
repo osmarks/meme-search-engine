@@ -177,6 +177,7 @@ class Index:
                             if filename not in filenames_set:
                                 new_data.append(numpy.frombuffer(embedding_vector, dtype="float16"))
                                 new_filenames.append(filename)
+                    if not new_data: return
                     new_data = numpy.array(new_data)
                     self.associated_filenames.extend(new_filenames)
                     self.faiss_index.add(new_data)
