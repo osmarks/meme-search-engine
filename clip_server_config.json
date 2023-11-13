@@ -1,6 +1,7 @@
 {
-    "model": "./out",
+    "model": "ViT-SO400M-14-SigLIP-384",
     "model_name": "siglip-so400m/14@384",
     "max_batch_size": 128,
-    "port": 1708
+    "port": 1708,
+    "device": "cuda:0"
 }

@@ -1,4 +1,4 @@
-import os
+import torch
 import time
 import threading
 from aiohttp import web
@@ -8,34 +8,22 @@ import traceback
 import umsgpack
 import collections
 import queue
+import open_clip
 from PIL import Image
 from prometheus_client import Counter, Histogram, REGISTRY, generate_latest
 import io
 import json
+import torchvision.transforms.transforms as transforms
 import sys
-import torch
-from transformers import SiglipImageProcessor, T5Tokenizer, SiglipModel, SiglipConfig
-from accelerate import init_empty_weights
-from accelerate.utils.modeling import set_module_tensor_to_device
-from safetensors import safe_open
-import numpy
 
 with open(sys.argv[1], "r") as config_file:
     CONFIG = json.load(config_file)
 
-DEVICE = CONFIG["device"]
-
-# So400m/14@384
-with init_empty_weights():
-    model = SiglipModel(config=SiglipConfig.from_pretrained(CONFIG["model"])).half().eval()
-with safe_open(os.path.join(CONFIG["model"], "model.safetensors"), framework="pt", device=DEVICE) as f:
-    for key in f.keys():
-        set_module_tensor_to_device(model, key, device=DEVICE, value=f.get_tensor(key))
-model = model.to(DEVICE)
-EMBDIM = model.config.vision_config.hidden_size # NOT projection_dim, why is that even there
-RES = model.config.vision_config.image_size
-tokenizer = T5Tokenizer(vocab_file=os.path.join(CONFIG["model"], "sentencepiece.model"), extra_ids=0, model_max_length=64, pad_token="</s>", legacy=False)
-image_processor = SiglipImageProcessor(size={"height": RES, "width":RES})
+device = torch.device(CONFIG["device"])
+model, _, preprocess = open_clip.create_model_and_transforms(CONFIG["model"], device=device, pretrained=dict(open_clip.list_pretrained())[CONFIG["model"]], precision="fp16")
+model.eval()
+tokenizer = open_clip.get_tokenizer(CONFIG["model"])
+print("Model loaded")
 
 BS = CONFIG["max_batch_size"]
 MODELNAME = CONFIG["model_name"]
@@ -46,6 +34,7 @@ items_ctr = Counter("modelserver_total_items", "Items run through model server",
 inference_time_hist = Histogram("modelserver_inftime", "Time running inference", ["model", "batch_size"])
 batch_count_ctr = Counter("modelserver_batchcount", "Inference batches run", ["model"])
 
+torch.set_grad_enabled(False)
 def do_inference(params: InferenceParameters):
     with torch.no_grad():
         try:
@@ -53,13 +42,13 @@ def do_inference(params: InferenceParameters):
             if text is not None:
                 items_ctr.labels(MODELNAME, "text").inc(text.shape[0])
                 with inference_time_hist.labels(MODELNAME + "-text", text.shape[0]).time():
-                    features = model.text_model.forward(input_ids=torch.tensor(text, device=DEVICE)).pooler_output
+                    features = model.encode_text(text)
                     features /= features.norm(dim=-1, keepdim=True)
                     features = features.cpu().numpy()
             elif images is not None:
-                items_ctr.labels(MODELNAME, "image").inc(images.shape[0])
                 with inference_time_hist.labels(MODELNAME + "-image", images.shape[0]).time():
-                    features = model.vision_model.forward(torch.tensor(images, device=DEVICE)).pooler_output
+                    items_ctr.labels(MODELNAME, "image").inc(images.shape[0])
+                    features = model.encode_image(images)
                     features /= features.norm(dim=-1, keepdim=True)
                     features = features.cpu().numpy()
             batch_count_ctr.labels(MODELNAME).inc()
@@ -67,6 +56,8 @@ def do_inference(params: InferenceParameters):
         except Exception as e:
             traceback.print_exc()
             callback(False, str(e))
+        finally:
+            torch.cuda.empty_cache()
 
 iq = queue.Queue(10)
 def infer_thread():
@@ -80,10 +71,10 @@ def preprocessing_thread():
         try:
             if text:
                 assert len(text) <= BS, f"max batch size is {BS}"
-                text = numpy.array(tokenizer([ t.lower() for t in text ], padding="max_length", truncation=True)["input_ids"])
+                text = tokenizer(text).to(device)
             elif images:
                 assert len(images) <= BS, f"max batch size is {BS}"
-                images = numpy.array(image_processor([ Image.open(io.BytesIO(bs)) for bs in images ])["pixel_values"]).astype("float16")
+                images = torch.stack([ preprocess(Image.open(io.BytesIO(im))).half() for im in images ]).to(device)
             else:
                 assert False, "images or text required"
             iq.put(InferenceParameters(text, images, callback))
@@ -118,10 +109,10 @@ async def run_inference(request):
 @routes.get("/config")
 async def config(request):
     return web.Response(body=umsgpack.dumps({
-        "model": MODELNAME,
+        "model": CONFIG["model"],
         "batch": BS,
-        "image_size": (RES, RES),
-        "embedding_size": EMBDIM
+        "image_size": [ t for t in preprocess.transforms if isinstance(t, transforms.Resize) ][0].size,
+        "embedding_size": model.text.text_projection.out_features
     }), status=200, content_type="application/msgpack")
 
 @routes.get("/")

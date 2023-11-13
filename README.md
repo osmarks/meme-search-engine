@@ -20,8 +20,9 @@ This is untested. It might work.
 * Serve your meme library from a static webserver.
     * I use nginx. If you're in a hurry, you can use `python -m http.server`.
 * Install Python dependencies with `pip` from `requirements.txt` (the versions probably shouldn't need to match exactly if you need to change them; I just put in what I currently have installed).
-    * You now need a [patched version](https://github.com/osmarks/transformers-patch-siglip) of `transformers` due to SigLIP support.
-    * I have converted exactly one SigLIP model: [https://huggingface.co/gollark/siglip-so400m-14-384](https://huggingface.co/gollark/siglip-so400m-14-384). It's apparently the best one. If you don't like it, find out how to convert more. You need to download that repo.
+    * ~~You now need a [patched version](https://github.com/osmarks/transformers-patch-siglip) of `transformers` due to SigLIP support.~~ OpenCLIP supports SigLIP. I am now using that.
+    * ~~I have converted exactly one SigLIP model: [https://huggingface.co/gollark/siglip-so400m-14-384](https://huggingface.co/gollark/siglip-so400m-14-384). It's apparently the best one. If you don't like it, find out how to convert more. You need to download that repo.~~ You can use any OpenCLIP model which OpenCLIP supports.
+* Run `thumbnailer.py` (periodically, at the same time as index reloads, ideally)
 * Run `clip_server.py` (as a background service).
     * It is configured with a JSON file given to it as its first argument. An example is in `clip_server_config.json`.
         * `device` should probably be `cuda` or `cpu`. The model will run on here.
