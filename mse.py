@@ -122,6 +122,7 @@ class Index:
                             files[filename] = modtime
                         await conn.commit()
                         batch = []
+                        seen_files = set()
 
                         failed = set()
                         for dirpath, _, filenames in os.walk(CONFIG["files"]):
@@ -131,6 +132,7 @@ class Index:
                                 path = os.path.join(dirpath, file)
                                 file = os.path.relpath(path, CONFIG["files"])
                                 st = os.stat(path)
+                                seen_files.add(file)
                                 if st.st_mtime != files.get(file):
                                     paths.add(path)
                             for task in asyncio.as_completed([ asyncio.get_running_loop().run_in_executor(executor, load_image, path, self.inference_server_config["image_size"]) for path in paths ]):
@@ -152,21 +154,7 @@ class Index:
 
                         print()
                         for failed_ in failed:
-                            print(failed_, "failed")
-
-                    remove_indices = []
-                    for index, filename in enumerate(self.associated_filenames):
-                        if filename not in files or filename in modified:
-                            remove_indices.append(index)
-                            self.associated_filenames[index] = None
-                        if filename not in files:
-                            await conn.execute("DELETE FROM files WHERE filename = ?", (filename,))
-                            await conn.commit()
-                    # TODO concurrency
-                    # TODO understand what that comment meant
-                    if remove_indices:
-                        self.faiss_index.remove_ids(numpy.array(remove_indices))
-                        self.associated_filenames = [ x for x in self.associated_filenames if x is not None ]
+                            print("Failed to load", failed_)
                 
                     filenames_set = set(self.associated_filenames)
                     new_data = []
@@ -181,6 +169,21 @@ class Index:
                     new_data = numpy.array(new_data)
                     self.associated_filenames.extend(new_filenames)
                     self.faiss_index.add(new_data)
+
+                    remove_indices = []
+                    for index, filename in enumerate(self.associated_filenames):
+                        if filename not in seen_files or filename in modified:
+                            remove_indices.append(index)
+                            self.associated_filenames[index] = None
+                        if filename not in seen_files:
+                            await conn.execute("DELETE FROM files WHERE filename = ?", (filename,))
+                            await conn.commit()
+                    print("Deleting", len(remove_indices), "old entries")
+                    # TODO concurrency
+                    # TODO understand what that comment meant
+                    if remove_indices:
+                        self.faiss_index.remove_ids(numpy.array(remove_indices))
+                        self.associated_filenames = [ x for x in self.associated_filenames if x is not None ]
                 finally:
                     await conn.close()
 
