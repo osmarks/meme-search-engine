@@ -83,7 +83,7 @@ class Index:
         async with self.lock:
             with ProcessPoolExecutor(max_workers=12) as executor:
                 print("Indexing")
-                conn = await aiosqlite.connect(CONFIG["db_path"], parent_loop=asyncio.get_running_loop())
+                conn = await aiosqlite.connect(CONFIG["db_path"])
                 conn.row_factory = aiosqlite.Row
                 await conn.executescript("""
         CREATE TABLE IF NOT EXISTS files (
