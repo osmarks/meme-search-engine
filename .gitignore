@@ -1,2 +1,10 @@
 */node_modules
 */static/app.*
+
+# Added by cargo
+
+/target
+meme-rater/images/
+meme-rater/meta/
+meme-rater/*.sqlite3*
+meme-rater/deploy_for_training.sh
