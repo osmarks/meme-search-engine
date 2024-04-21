@@ -11,15 +11,22 @@ routes = web.RouteTableDef()
 
 async def get_pair(db):
     while True:
-        filenames = [ x[0] for x in await db.execute_fetchall("SELECT filename FROM files", ()) ]
-        m1, m2 = tuple(sorted(random.sample(filenames, 2)))
+        csr = await db.execute("SELECT * FROM queue")
+        row = await csr.fetchone()
+        await csr.close()
+        iteration = None
+        if row:
+            m1, m2, iteration = row
+        else:
+            filenames = [ x[0] for x in await db.execute_fetchall("SELECT filename FROM files", ()) ]
+            m1, m2 = tuple(sorted(random.sample(filenames, 2)))
         csr = await db.execute("SELECT 1 FROM ratings WHERE meme1 = ? AND meme2 = ?", (m1, m2))
         if not await csr.fetchone():
-            return m1, m2
+            return m1, m2, iteration
 
 @routes.get("/")
 async def index(request):
-    meme1, meme2 = await get_pair(request.app["db"])
+    meme1, meme2, iteration = await get_pair(request.app["db"])
     return web.Response(text=f"""
 <!DOCTYPE html>
 <html>
@@ -46,6 +53,7 @@ async def index(request):
 
             <input type="hidden" name="meme1" value="{meme1}">
             <input type="hidden" name="meme2" value="{meme2}">
+            <input type="hidden" name="iteration" value="{str(iteration or 0)}">
             <input type="submit" value="Submit">
             <div class="memes">
                 <img src="/memes/{meme1}" id="meme1">
@@ -81,8 +89,10 @@ async def rate(request):
     post = await request.post()
     meme1 = post["meme1"]
     meme2 = post["meme2"]
+    iteration = post["iteration"]
     rating = post["rating"]
-    await db.execute("INSERT INTO ratings (meme1, meme2, rating) VALUES (?, ?, ?)", (meme1, meme2, rating))
+    await db.execute("INSERT INTO ratings (meme1, meme2, rating, iteration) VALUES (?, ?, ?, ?)", (meme1, meme2, rating, iteration))
+    await db.execute("DELETE FROM queue WHERE meme1 = ? AND meme2 = ?", (meme1, meme2))
     await db.commit()
     return web.HTTPFound("/")
 
@@ -93,7 +103,14 @@ CREATE TABLE IF NOT EXISTS ratings (
     meme1 TEXT NOT NULL,
     meme2 TEXT NOT NULL,
     rating TEXT NOT NULL,
+    iteration TEXT,
     UNIQUE (meme1, meme2)
+);
+CREATE TABLE IF NOT EXISTS queue (
+    meme1 TEXT NOT NULL,
+    meme2 TEXT NOT NULL,
+    iteration TEXT NOT NULL,
+    UNIQUE (meme1, meme2, iteration)
 );
 """)
     app.router.add_routes(routes)
