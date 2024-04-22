@@ -42,10 +42,11 @@ async def run_query(request):
     if text := data.get("text", []):
         embeddings.extend(await clip_server({ "text": [ x for x, w in text ] }))
     weights = [ w for x, w in images ] + [ w for x, w in text ]
-    embeddings = [ e * w for e, w in zip(embeddings, weights) ]
-    if not embeddings:
+    weighted_embeddings = [ e * w for e, w in zip(embeddings, weights) ]
+    weighted_embeddings.extend([ numpy.array(x) for x in data.get("embeddings", []) ])
+    if not weighted_embeddings:
         return web.json_response([])
-    return web.json_response(app["index"].search(sum(embeddings)))
+    return web.json_response(app["index"].search(sum(weighted_embeddings), top_k=data.get("top_k", 4000)))
 
 @routes.get("/")
 async def health_check(request):
@@ -70,8 +71,8 @@ class Index:
         self.inference_server_config = inference_server_config
         self.lock = asyncio.Lock()
 
-    def search(self, query):
-        distances, indices = self.faiss_index.search(numpy.array([query]), 4000)
+    def search(self, query, top_k):
+        distances, indices = self.faiss_index.search(numpy.array([query]), top_k)
         distances = distances[0]
         indices = indices[0]
         try:
@@ -214,6 +215,7 @@ async def main():
     app["index"] = index
     await index.reload()
     print("Ready")
+    if CONFIG.get("no_run_server", False): return
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "", CONFIG["port"])
@@ -223,4 +225,4 @@ if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(main())
-    loop.run_forever()
+    if CONFIG.get("no_run_server", False) == False: loop.run_forever()

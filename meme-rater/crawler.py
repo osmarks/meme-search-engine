@@ -67,52 +67,58 @@ async def download(sess, url, file):
                 await fh.write(chunk)
         return dict(res.headers)
 
-if __name__ == "__main__":
-    async def main():
-        sem = asyncio.Semaphore(16)
-        
-        async with aiohttp.ClientSession() as sess:
-            async def download_item(item):
-                #print("starting on", item["name"])
-                print(".", end="")
+async def main(time_threshold):
+    sem = asyncio.Semaphore(16)
+    
+    async with aiohttp.ClientSession() as sess:
+        async def download_item(item):
+            #print("starting on", item["name"])
+            print(".", end="")
+            sys.stdout.flush()
+            if item["over_18"] or not item["is_robot_indexable"]: return
+            id = item["name"]
+            bck = bucket(id)
+            os.makedirs(os.path.join("images", bck), exist_ok=True)
+            os.makedirs(os.path.join("meta", bck), exist_ok=True)
+            if not item["url"].startswith("https://"): return
+            meta_path = os.path.join("meta", bck, id + ".json")
+            if not os.path.exists(meta_path): # sorry
+                print("|", end="")
                 sys.stdout.flush()
-                if item["over_18"] or not item["is_robot_indexable"]: return
-                id = item["name"]
-                bck = bucket(id)
-                os.makedirs(os.path.join("images", bck), exist_ok=True)
-                os.makedirs(os.path.join("meta", bck), exist_ok=True)
-                if not item["url"].startswith("https://"): return
-                meta_path = os.path.join("meta", bck, id + ".json")
-                if not os.path.exists(meta_path): # sorry
-                    print("|", end="")
+                try:
+                    result = await download(sess, item["url"], os.path.join("images", bck, id))
+                except Exception as e:
+                    print("\nMeme acquisition failure:", e)
+                    return
+                if result:
+                    item["headers"] = result
+                    with open(meta_path, "w") as fh:
+                        json.dump(item, fh)
+                else:
+                    print("!", end="")
                     sys.stdout.flush()
-                    try:
-                        result = await download(sess, item["url"], os.path.join("images", bck, id))
-                    except Exception as e:
-                        print("\nMeme acquisition failure:", e)
+            #print("done on", id)
+
+        async def dl_task(item):
+            async with sem:
+                try:
+                    await asyncio.wait_for(download_item(item), timeout=30)
+                except asyncio.TimeoutError: pass
+
+        async for items in fetch_past(sess, "https://www.reddit.com/user/osmarks/m/memeharvesting/new", 20000):
+            #print("got new chunk")
+            await sem.acquire()
+            sem.release()
+            #print("downloading new set")
+            async with asyncio.TaskGroup() as tg:
+                for item in items:
+                    if time_threshold and time_threshold > item["created"]:
                         return
-                    if result:
-                        item["headers"] = result
-                        with open(meta_path, "w") as fh:
-                            json.dump(item, fh)
-                    else:
-                        print("!", end="")
-                        sys.stdout.flush()
-                #print("done on", id)
+                    tg.create_task(dl_task(item))
 
-            async def dl_task(item):
-                async with sem:
-                    try:
-                        await asyncio.wait_for(download_item(item), timeout=30)
-                    except asyncio.TimeoutError: pass
-
-            async for items in fetch_past(sess, "https://www.reddit.com/user/osmarks/m/memeharvesting/new", 20000):
-                #print("got new chunk")
-                await sem.acquire()
-                sem.release()
-                #print("downloading new set")
-                async with asyncio.TaskGroup() as tg:
-                    for item in items:
-                        tg.create_task(dl_task(item))
-
-    asyncio.run(main())
+if __name__ == "__main__":
+    threshold = None
+    if len(sys.argv) > 1:
+        print("thresholding at", sys.argv[1])
+        threshold = float(sys.argv[1])
+    asyncio.run(main(threshold))
