@@ -2,5 +2,6 @@
     "clip_server": "http://100.64.0.10:1708/",
     "db_path": "data.sqlite3",
     "port": 1707,
-    "files": "./images"
+    "files": "./images",
+    "no_run_server": true
 }

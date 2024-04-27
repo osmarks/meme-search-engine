@@ -12,7 +12,7 @@ import shared
 from model import Config, BradleyTerry
 
 meme_search_backend = "http://localhost:1707/"
-score_threshold = 1.5162627696990967
+score_threshold = 1.7264162302017212
 
 shared.db.executescript("""
 CREATE TABLE IF NOT EXISTS last_crawl (time INTEGER);
@@ -71,7 +71,8 @@ with torch.inference_mode():
         for filename, mscore in zip(filenames, mscores):
             ratings[filename] = float(mscore)
 
-print(sorted(ratings.values())[round(len(ratings) * 0.85)])
+print(sorted(ratings.values())[round(len(ratings) * 0.95)])
+print(f"{len(ratings)} memes in {crawl_start - last_crawl} seconds ({len(ratings) / (crawl_start - last_crawl) * 1e3}mHz)")
 
 files = dict(files)
 
