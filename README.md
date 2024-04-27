@@ -44,6 +44,20 @@ This is untested. It might work.
         * `backend_url` is the URL `mse.py` is exposed on (trailing slash probably optional).
 * If you want, configure Prometheus to monitor `mse.py` and `clip_server.py`.
 
+## MemeThresher
+
+See [here](https://osmarks.net/memethresher/) for information on MemeThresher, the new automatic meme acquisition/rating system (under `meme-rater`). Deploying it yourself is anticipated to be somewhat tricky but should be roughly doable:
+
+1. Edit `crawler.py` with your own source and run it to collect an initial dataset.
+2. Run `mse.py` with a config file like the provided one to index it.
+3. Use `rater_server.py` to collect an initial dataset of pairs.
+4. Copy to a server with a GPU and use `train.py` to train a model. You might need to adjust hyperparameters since I have no idea which ones are good.
+5. Use `active_learning.py` on the best available checkpoint to get new pairs to rate.
+6. Use `copy_into_queue.py` to copy the new pairs into the `rater_server.py` queue.
+7. Rate the resulting pairs.
+8. Repeat 4 through 7 until you feel good enough about your model.
+9. Deploy `library_processing_server.py` and schedule `meme_pipeline.py` to run periodically.
+
 ## Scaling
 
 Meme Search Engine uses an in-memory FAISS index to hold its embedding vectors, because I was lazy and it works fine (~100MB total RAM used for my 8000 memes). If you want to store significantly more than that you will have to switch to a more efficient/compact index (see [here](https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index)). As vector indices are held exclusively in memory, you will need to either persist them to disk or use ones which are fast to build/remove from/add to (presumably PCA/PQ indices). At some point if you increase total traffic the CLIP model may also become a bottleneck, as I also have no batching strategy. Indexing is currently GPU-bound since the new model appears somewhat slower at high batch sizes and I improved the image loading pipeline. You may also want to scale down displayed memes to cut bandwidth needs.
