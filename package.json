@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "better-sqlite3": "^10.0.0",
+    "chrome-lens-ocr": "^2.0.1",
+    "sharp": "^0.33.4"
+  }
+}
