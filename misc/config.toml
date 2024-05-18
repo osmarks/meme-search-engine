@@ -1,0 +1,4 @@
+log_level = "debug"
+listen_address = "[::1]:1710"
+db_path = "./mse.sqlite3"
+images_path = "/data/public"
