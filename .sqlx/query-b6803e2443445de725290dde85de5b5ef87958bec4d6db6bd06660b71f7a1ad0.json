@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE files SET thumbnails = ?, thumbnail_time = ? WHERE filename = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "b6803e2443445de725290dde85de5b5ef87958bec4d6db6bd06660b71f7a1ad0"
+}

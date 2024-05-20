@@ -6,3 +6,6 @@ meme-rater/meta/
 meme-rater/*.sqlite3*
 meme-rater/deploy_for_training.sh
 node_modules/*
+node_modules
+*sqlite3*
+thumbtemp

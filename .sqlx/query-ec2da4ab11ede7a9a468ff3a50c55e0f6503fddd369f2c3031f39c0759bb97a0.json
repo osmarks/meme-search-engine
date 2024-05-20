@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT * FROM files WHERE filename = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "filename",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "embedding_time",
+        "ordinal": 1,
+        "type_info": "Int64"
+      },
+      {
+        "name": "ocr_time",
+        "ordinal": 2,
+        "type_info": "Int64"
+      },
+      {
+        "name": "thumbnail_time",
+        "ordinal": 3,
+        "type_info": "Int64"
+      },
+      {
+        "name": "embedding",
+        "ordinal": 4,
+        "type_info": "Blob"
+      },
+      {
+        "name": "ocr",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "raw_ocr_segments",
+        "ordinal": 6,
+        "type_info": "Blob"
+      },
+      {
+        "name": "thumbnails",
+        "ordinal": 7,
+        "type_info": "Blob"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "ec2da4ab11ede7a9a468ff3a50c55e0f6503fddd369f2c3031f39c0759bb97a0"
+}

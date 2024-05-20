@@ -1,5 +1,5 @@
 {
-    "backend_url": "https://mse.osmarks.net/backend",
-    "image_path": "https://i2.osmarks.net/memes-or-something/",
-    "thumb_path": "https://i2.osmarks.net/thumbs/memes-or-something_"
+    "backend_url": "http://localhost:1707/",
+    "image_path": "http://localhost:7858/",
+    "thumb_path": "http://localhost:7857/"
 }

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE files SET embedding_time = ?, embedding = ? WHERE filename = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "bed71d48c691bff7464b1aa767162df98ee2fcbe8df11f7db18a3647b2e0f1a2"
+}

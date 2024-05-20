@@ -62,6 +62,8 @@
 
     .result
         border: 1px solid gray
+        *
+            display: block
     .result img
         width: 100%
 </style>
@@ -109,17 +111,22 @@
     <Loading />
 {/if}
 {#if results}
+    {#if displayedResults.length === 0}
+        No results. Wait for index rebuild.
+    {/if}
     <Masonry bind:refreshLayout={refreshLayout} colWidth="minmax(Min(20em, 100%), 1fr)" items={displayedResults}>
         {#each displayedResults as result}
             {#key result.file}
                 <div class="result">
-                    <a href={util.getURL(result.file)}>
+                    <a href={util.getURL(result)}>
                         <picture>
-                            {#if util.hasThumbnails(result.file)}
-                                <source srcset={util.thumbnailPath(result.file, "avif-lq") + ", " + util.thumbnailPath(result.file, "avif-hq") + " 2x"} type="image/avif" />
-                                <source srcset={util.thumbnailPath(result.file, "jpeg-800") + " 800w, " + util.thumbnailPath(result.file, "jpeg-fullscale")} type="image/jpeg" />
+                            {#if util.hasFormat(results, result, "avifl")}
+                                <source srcset={util.thumbnailURL(results, result, "avifl") + (util.hasFormat(results, result, "avifh") ? ", " + util.thumbnailURL(results, result, "avifh") + " 2x" : "")} type="image/avif" />
                             {/if}
-                            <img src={util.getURL(result.file)} on:load={updateCounter} on:error={updateCounter} alt={result.caption || result.file}>
+                            {#if util.hasFormat(results, result, "jpegl")}
+                                <source srcset={util.thumbnailURL(results, result, "jpegl") + (util.hasFormat(results, result, "jpegh") ? ", " + util.thumbnailURL(results, result, "jpegh") + " 2x" : "")} type="image/jpeg" />
+                            {/if}
+                            <img src={util.getURL(result)} on:load={updateCounter} on:error={updateCounter} alt={result[1]}>
                         </picture>
                     </a>
                 </div>
@@ -171,9 +178,7 @@
     let displayedResults = []
     const runSearch = async () => {
         if (!resultPromise) {
-            let args = {}
-            args.text = queryTerms.filter(x => x.type === "text" && x.text).map(({ text, weight, sign }) => [ text, weight * { "+": 1, "-": -1 }[sign] ])
-            args.images = queryTerms.filter(x => x.type === "image").map(({ imageData, weight, sign }) => [ imageData, weight * { "+": 1, "-": -1 }[sign] ])
+            let args = {"terms": queryTerms.map(x => ({ image: x.imageData, text: x.text, weight: x.weight * { "+": 1, "-": -1 }[x.sign] }))}
             resultPromise = util.doQuery(args).then(res => {
                 error = null
                 results = res
@@ -181,7 +186,8 @@
                 displayedResults = []
                 pendingImageLoads = 0
                 for (let i = 0; i < chunkSize; i++) {
-                    displayedResults.push(results[i])
+                    if (i >= results.matches.length) break
+                    displayedResults.push(results.matches[i])
                     pendingImageLoads += 1
                 }
                 redrawGrid()
@@ -195,7 +201,8 @@
             if (window.scrollY + window.innerHeight < heightThreshold) return;
             let init = displayedResults.length
             for (let i = 0; i < chunkSize; i++) {
-                displayedResults.push(results[init + i])
+                if (init + i >= results.matches.length) break
+                displayedResults.push(results.matches[init + i])
                 pendingImageLoads += 1
             }
             displayedResults = displayedResults
