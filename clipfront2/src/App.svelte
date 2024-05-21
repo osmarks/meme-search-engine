@@ -8,6 +8,7 @@
     \:global(body)
         font-family: "Fira Sans", "Noto Sans", "Segoe UI", Verdana, sans-serif
         font-weight: 300
+        overflow-anchor: none
         //margin: 0
         //min-height: 100vh
 
@@ -116,7 +117,7 @@
     {/if}
     <Masonry bind:refreshLayout={refreshLayout} colWidth="minmax(Min(20em, 100%), 1fr)" items={displayedResults}>
         {#each displayedResults as result}
-            {#key result.file}
+            {#key `${queryCounter}${result.file}`}
                 <div class="result">
                     <a href={util.getURL(result)}>
                         <picture>
@@ -145,6 +146,7 @@
     const chunkSize = 40
 
     let queryTerms = []
+    let queryCounter = 0
 
     const focusEl = el => el.focus()
     const newTextQuery = (content=null) => {
@@ -170,8 +172,11 @@
         heightThreshold = Math.min(...maxOffsets.values())
         console.log(heightThreshold, pendingImageLoads)
     }
-    const redrawGrid = () => {
-        if (refreshLayout) refreshLayout().then(recomputeScroll)
+    const redrawGrid = async () => {
+        if (refreshLayout) {
+            refreshLayout()
+            await recomputeScroll()
+        }
     }
     let resultPromise
     let results
@@ -179,6 +184,7 @@
     const runSearch = async () => {
         if (!resultPromise) {
             let args = {"terms": queryTerms.map(x => ({ image: x.imageData, text: x.text, weight: x.weight * { "+": 1, "-": -1 }[x.sign] }))}
+            queryCounter += 1
             resultPromise = util.doQuery(args).then(res => {
                 error = null
                 results = res
