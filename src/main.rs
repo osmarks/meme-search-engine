@@ -347,7 +347,7 @@ async fn ingest_files(config: Arc<Config>, backend: Arc<InferenceServerConfig>) 
                                 loop {
                                     let quality = (lb + ub) / 2;
                                     let thumbnail = rgb.resize(
-                                        format_config.target_width,
+                                        format_config.target_width.min(rgb.width()),
                                         u32::MAX,
                                         FilterType::Lanczos3,
                                     );
@@ -370,7 +370,7 @@ async fn ingest_files(config: Arc<Config>, backend: Arc<InferenceServerConfig>) 
                                 }
                             } else {
                                 let thumbnail = rgb.resize(
-                                    format_config.target_width,
+                                    format_config.target_width.min(rgb.width()),
                                     u32::MAX,
                                     FilterType::Lanczos3,
                                 );
@@ -590,7 +590,6 @@ async fn build_index(config: Arc<Config>, backend: Arc<InferenceServerConfig>) -
     let pool = initialize_database(&config).await?;
 
     let mut index = IIndex {
-        // Use a suitable vector similarity search library for Rust
         vectors: faiss::index_factory(backend.embedding_size as u32, "SQfp16", faiss::MetricType::InnerProduct)?,
         filenames: Vec::new(),
         format_codes: Vec::new(),
