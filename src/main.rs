@@ -236,7 +236,7 @@ fn image_formats(_config: &Config) -> HashMap<String, ImageFormatConfig> {
         ImageFormatConfig {
             target_width: 800,
             target_filesize: 0,
-            quality: 30,
+            quality: 70,
             format: ImageFormat::Avif,
             extension: "avif".to_string(),
         },
