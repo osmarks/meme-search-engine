@@ -73,7 +73,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS ocr_fts USING fts5 (
     filename,
     ocr,
     tokenize='unicode61 remove_diacritics 2',
-    content='ocr'
+    content='files'
 );
 
 CREATE TRIGGER IF NOT EXISTS ocr_fts_ins AFTER INSERT ON files BEGIN
