@@ -55,6 +55,11 @@ filetypes = {
     "image/webp": "webp",
     "image/avif": "avif"
 }
+hard_exclude = {
+    ".mp4",
+    ".mkv",
+    ".webm"
+}
 
 CHUNK_SIZE = 1<<18 # entirely arbitrary
 async def download(sess, url, file):
@@ -80,13 +85,20 @@ async def main(time_threshold):
             bck = bucket(id)
             os.makedirs(os.path.join("images", bck), exist_ok=True)
             os.makedirs(os.path.join("meta", bck), exist_ok=True)
+            if not item.get("preview"): return
             if not item["url"].startswith("https://"): return
             meta_path = os.path.join("meta", bck, id + ".json")
             if not os.path.exists(meta_path): # sorry
                 print("|", end="")
                 sys.stdout.flush()
+                excluded = False
+                for excl in hard_exclude:
+                    if item["url"].endswith(excl):
+                        excluded = True
+                        break
                 try:
-                    result = await download(sess, item["url"], os.path.join("images", bck, id))
+                    if not excluded:
+                        result = await download(sess, item["url"], os.path.join("images", bck, id))
                 except Exception as e:
                     print("\nMeme acquisition failure:", e)
                     return

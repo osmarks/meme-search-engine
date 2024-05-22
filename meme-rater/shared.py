@@ -14,7 +14,7 @@ def is_val_set(meme1, meme2):
     return is_one_val(meme1) or is_one_val(meme2)
 
 def fetch_embedding(filename):
-    csr = db.execute("SELECT embedding_vector FROM files WHERE filename = ?", (filename,))
+    csr = db.execute("SELECT embedding FROM files WHERE filename = ?", (filename,))
     x = numpy.frombuffer(csr.fetchone()[0], dtype="float16")
     csr.close()
     return x.copy() # PyTorch complains otherwise due to bad
@@ -44,7 +44,7 @@ def generate_random_permutations(x, n):
     return out
 
 def fetch_all_files():
-    csr = db.execute("SELECT filename, embedding_vector FROM files")
+    csr = db.execute("SELECT filename, embedding FROM files WHERE embedding IS NOT NULL")
     x = [ (row[0], numpy.frombuffer(row[1], dtype="float16").copy()) for row in csr.fetchall() ]
     csr.close()
     return x

@@ -35,7 +35,7 @@ print("crawling...")
 crawl_start = time.time()
 subprocess.run(["python", "crawler.py", str(last_crawl)]).check_returncode()
 print("indexing...")
-subprocess.run(["python", "../mse.py", "rater_mse_config.json"]).check_returncode()
+subprocess.run(["./meme-search-engine", "rater_mse_config.json"]).check_returncode()
 print("evaluating...")
 
 batch_size = 128
@@ -80,11 +80,11 @@ async def run_inserts():
     async with aiohttp.ClientSession():
         async def duplicate_exists(embedding):
             async with aiohttp.request("POST", meme_search_backend, json={
-                "embeddings": [ list(float(x) for x in embedding) ], # sorry
-                "top_k": 1
+                "terms": [{ "embedding": list(float(x) for x in embedding) }], # sorry
+                "k": 1
             }) as res:
                 result = await res.json()
-                closest = result[0]["score"]
+                closest = result["matches"][0][0]
                 return closest > 0.99 # arbitrary threshold, TODO
 
         for filename, rating in ratings.items():
