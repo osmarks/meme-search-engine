@@ -20,10 +20,11 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use walkdir::WalkDir;
 use base64::prelude::*;
-use faiss::Index;
+use faiss::{ConcurrentIndex, Index};
 use futures_util::stream::{StreamExt, TryStreamExt};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
+use faiss::index::scalar_quantizer;
 
 mod ocr;
 
@@ -51,7 +52,7 @@ struct Config {
 
 #[derive(Debug)]
 struct IIndex {
-    vectors: faiss::index::IndexImpl,
+    vectors: scalar_quantizer::ScalarQuantizerIndexImpl,
     filenames: Vec<String>,
     format_codes: Vec<u64>,
     format_names: Vec<String>,
@@ -86,7 +87,7 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS ocr_fts_upd AFTER UPDATE ON files BEGIN
     INSERT INTO ocr_fts (ocr_fts, rowid, filename, ocr) VALUES ('delete', old.rowid, old.filename, COALESCE(old.ocr, ''));
-    INSERT INTO ocr_fts (rowid, filename, text) VALUES (new.rowid, new.filename, COALESCE(new.ocr, ''));
+    INSERT INTO ocr_fts (rowid, filename, ocr) VALUES (new.rowid, new.filename, COALESCE(new.ocr, ''));
 END;
 "#;
 
@@ -590,7 +591,7 @@ async fn build_index(config: Arc<Config>, backend: Arc<InferenceServerConfig>) -
     let pool = initialize_database(&config).await?;
 
     let mut index = IIndex {
-        vectors: faiss::index_factory(backend.embedding_size as u32, "SQfp16", faiss::MetricType::InnerProduct)?,
+        vectors: scalar_quantizer::ScalarQuantizerIndexImpl::new(backend.embedding_size as u32, scalar_quantizer::QuantizerType::QT_fp16, faiss::MetricType::InnerProduct)?,
         filenames: Vec::new(),
         format_codes: Vec::new(),
         format_names: Vec::new(),
@@ -680,7 +681,7 @@ struct QueryRequest {
     k: Option<usize>,
 }
 
-async fn query_index(index: &mut IIndex, query: EmbeddingVector, k: usize) -> Result<QueryResult> {
+async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize) -> Result<QueryResult> {
     let result = index.vectors.search(&query, k as usize)?;
 
     let items = result.distances
@@ -708,7 +709,7 @@ async fn handle_request(
     config: &Config,
     backend_config: Arc<InferenceServerConfig>,
     client: Arc<Client>,
-    index: &mut IIndex,
+    index: &IIndex,
     req: Json<QueryRequest>,
 ) -> Result<Response<Body>> {
     let mut total_embedding = ndarray::Array::from(vec![0.0; backend_config.embedding_size]);
@@ -808,7 +809,7 @@ async fn main() -> Result<()> {
 
     let (request_ingest_tx, mut request_ingest_rx) = mpsc::channel(1);
 
-    let index = Arc::new(tokio::sync::Mutex::new(build_index(config.clone(), backend.clone()).await?));
+    let index = Arc::new(tokio::sync::RwLock::new(build_index(config.clone(), backend.clone()).await?));
 
     let (ingest_done_tx, _ingest_done_rx) = broadcast::channel(1);
     let done_tx = Arc::new(ingest_done_tx.clone());
@@ -824,7 +825,7 @@ async fn main() -> Result<()> {
                     Ok(_) => {
                         match build_index(config.clone(), backend.clone()).await {
                             Ok(new_index) => {
-                                *index.lock().await = new_index;
+                                *index.write().await = new_index;
                             }
                             Err(e) => {
                                 log::error!("Index build failed: {:?}", e);
@@ -851,9 +852,9 @@ async fn main() -> Result<()> {
         .route("/", post(|req| async move {
             let config = config.clone();
             let backend_config = backend.clone();
-            let mut index = index.lock().await; // TODO: use ConcurrentIndex here
+            let index = index.read().await; // TODO: use ConcurrentIndex here
             let client = client.clone();
-            handle_request(&config, backend_config, client.clone(), &mut index, req).await.map_err(|e| format!("{:?}", e))
+            handle_request(&config, backend_config, client.clone(), &index, req).await.map_err(|e| format!("{:?}", e))
         }))
         .route("/", get(|_req: axum::http::Request<axum::body::Body>| async move {
             "OK"
