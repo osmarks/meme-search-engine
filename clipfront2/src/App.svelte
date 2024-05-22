@@ -95,6 +95,9 @@
                 {:else if term.type === "text"}
                     <input type="search" use:focusEl on:keydown={handleKey} bind:value={term.text} />
                 {/if}
+                {#if term.type === "embedding"}
+                    <span>[embedding loaded from URL]</span>
+                {/if}
             </li>
         {/each}
     </ul>
@@ -148,6 +151,20 @@
     let queryTerms = []
     let queryCounter = 0
 
+    const decodeFloat16 = uint16 => {
+        const sign = (uint16 & 0x8000) ? -1 : 1
+        const exponent = (uint16 & 0x7C00) >> 10
+        const fraction = uint16 & 0x03FF
+
+        if (exponent === 0) {
+            return sign * Math.pow(2, -14) * (fraction / Math.pow(2, 10))
+        } else if (exponent === 0x1F) {
+            return fraction ? NaN : sign * Infinity
+        } else {
+            return sign * Math.pow(2, exponent - 15) * (1 + fraction / Math.pow(2, 10))
+        }
+    }
+
     const focusEl = el => el.focus()
     const newTextQuery = (content=null) => {
         queryTerms.push({ type: "text", weight: 1, sign: "+", text: typeof content === "string" ? content : "" })
@@ -183,7 +200,7 @@
     let displayedResults = []
     const runSearch = async () => {
         if (!resultPromise) {
-            let args = {"terms": queryTerms.map(x => ({ image: x.imageData, text: x.text, weight: x.weight * { "+": 1, "-": -1 }[x.sign] }))}
+            let args = {"terms": queryTerms.map(x => ({ image: x.imageData, text: x.text, embedding: x.embedding, weight: x.weight * { "+": 1, "-": -1 }[x.sign] }))}
             queryCounter += 1
             resultPromise = util.doQuery(args).then(res => {
                 error = null
@@ -250,6 +267,12 @@
     const queryStringParams = new URLSearchParams(window.location.search)
     if (queryStringParams.get("q")) {
         newTextQuery(queryStringParams.get("q"))
+        runSearch()
+    }
+    if (queryStringParams.get("e")) {
+        const binaryData = atob(queryStringParams.get("e").replace(/\-/g, "+").replace(/_/g, "/"))
+        const uint16s = new Uint16Array(new Uint8Array(binaryData.split('').map(c => c.charCodeAt(0))).buffer)
+        queryTerms.push({ type: "embedding", weight: 1, sign: "+", embedding: Array.from(uint16s).map(decodeFloat16) })
         runSearch()
     }
 </script>
