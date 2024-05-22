@@ -15,7 +15,7 @@ They say a picture is worth a thousand words. Unfortunately, many (most?) sets o
 
 ## Setup
 
-This is untested. It might work.
+This is untested. It might work. The new Rust version simplifies some steps (it integrates its own thumbnailing).
 
 * Serve your meme library from a static webserver.
     * I use nginx. If you're in a hurry, you can use `python -m http.server`.
@@ -30,19 +30,20 @@ This is untested. It might work.
         * `model_name` is the name of the model for metrics purposes.
         * `max_batch_size` controls the maximum allowed batch size. Higher values generally result in somewhat better performance (the bottleneck in most cases is elsewhere right now though) at the cost of higher VRAM use.
         * `port` is the port to run the HTTP server on.
-* Run `mse.py` (also as a background service).
+* Build and run `meme-search-engine` (Rust) (also as a background service).
     * This needs to be exposed somewhere the frontend can reach it. Configure your reverse proxy appropriately.
     * It has a JSON config file as well.
         * `clip_server` is the full URL for the backend server.
         * `db_path` is the path for the SQLite database of images and embedding vectors.
         * `files` is where meme files will be read from. Subdirectories are indexed.
         * `port` is the port to serve HTTP on.
+        * If you are deploying to the public set `enable_thumbs` to `true` to serve compressed images.
 * Build clipfront2, host on your favourite static webserver.
     * `npm install`, `node src/build.js`.
     * You will need to rebuild it whenever you edit `frontend_config.json`.
         * `image_path` is the base URL of your meme webserver (with trailing slash).
         * `backend_url` is the URL `mse.py` is exposed on (trailing slash probably optional).
-* If you want, configure Prometheus to monitor `mse.py` and `clip_server.py`.
+* If you want, configure Prometheus to monitor `clip_server.py`.
 
 ## MemeThresher
 
