@@ -105,7 +105,7 @@
                     <span>[embedding loaded from URL]</span>
                 {/if}
                 {#if term.type === "predefined_embedding"}
-                    <span>{term.predefinedEmbedding}</span>
+                    <span>{term.sign === "-" ? invertEmbeddingDesc(term.predefinedEmbedding) : term.predefinedEmbedding}</span>
                 {/if}
             </li>
         {/each}
@@ -183,6 +183,12 @@
         }
         queryTerms = queryTerms
         predefinedEmbeddingName = "Sliders"
+    }
+
+    const invertEmbeddingDesc = x => {
+        const [fst, snd] = x.split("/")
+        if (snd === undefined) return "Not " + fst
+        return `${snd}/${fst}`
     }
 
     const decodeFloat16 = uint16 => {
