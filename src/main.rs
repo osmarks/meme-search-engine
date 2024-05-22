@@ -27,6 +27,7 @@ use tower_http::cors::CorsLayer;
 use faiss::index::scalar_quantizer;
 use lazy_static::lazy_static;
 use prometheus::{register_int_counter, register_int_counter_vec, register_int_gauge, Encoder, IntCounter, IntGauge, IntCounterVec};
+use ndarray::ArrayBase;
 
 mod ocr;
 
@@ -93,6 +94,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS ocr_fts USING fts5 (
     content='files'
 );
 
+CREATE TABLE IF NOT EXISTS predefined_embeddings (
+    name TEXT NOT NULL PRIMARY KEY,
+    embedding BLOB NOT NULL
+);
+
 CREATE TRIGGER IF NOT EXISTS ocr_fts_ins AFTER INSERT ON files BEGIN
     INSERT INTO ocr_fts (rowid, filename, ocr) VALUES (new.rowid, new.filename, COALESCE(new.ocr, ''));
 END;
@@ -127,10 +133,11 @@ struct InferenceServerConfig {
     embedding_size: usize,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 struct WConfig {
     backend: InferenceServerConfig,
-    service: Config
+    service: Config,
+    predefined_embeddings: HashMap<String, ArrayBase<ndarray::OwnedRepr<f32>, ndarray::prelude::Dim<[usize; 1]>>>
 }
 
 async fn query_clip_server<I, O>(
@@ -699,6 +706,7 @@ struct QueryTerm {
     embedding: Option<EmbeddingVector>,
     image: Option<String>,
     text: Option<String>,
+    predefined_embedding: Option<String>,
     weight: Option<f32>,
 }
 
@@ -760,6 +768,10 @@ async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IInde
                 total_embedding[i] += value * weight;
             }
         }
+        if let Some(name) = &term.predefined_embedding {
+            let embedding = config.predefined_embeddings.get(name).context("name invalid")?;
+            total_embedding = total_embedding + embedding * term.weight.unwrap_or(1.0);
+        }
     }
     
     let mut batches = vec![];    
@@ -806,6 +818,12 @@ async fn get_backend_config(config: &Config) -> Result<InferenceServerConfig> {
     Ok(rmp_serde::from_slice(&res.bytes().await?)?)
 }
 
+#[derive(Serialize, Deserialize)]
+struct FrontendInit {
+    n_total: u64,
+    predefined_embedding_names: Vec<String>
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     pretty_env_logger::init();
@@ -826,9 +844,21 @@ async fn main() -> Result<()> {
         }
     };
 
+    let mut predefined_embeddings = HashMap::new();
+
+    {
+        let db = initialize_database(&config).await?;
+        let result = sqlx::query!("SELECT * FROM predefined_embeddings")
+            .fetch_all(&db).await?;
+        for row in result {
+            predefined_embeddings.insert(row.name, ndarray::Array::from(decode_fp16_buffer(&row.embedding)));
+        }
+    }
+
     let config = Arc::new(WConfig {
         service: config,
-        backend
+        backend,
+        predefined_embeddings
     });
 
     if config.service.no_run_server {
@@ -878,6 +908,8 @@ async fn main() -> Result<()> {
 
     let config_ = config.clone();
     let client = Arc::new(Client::new());
+    let index_ = index.clone();
+    let config__ = config.clone();
     let app = Router::new()
         .route("/", post(|req| async move {
             let config = config.clone();
@@ -886,10 +918,13 @@ async fn main() -> Result<()> {
             QUERIES_COUNTER.inc();
             handle_request(config, client.clone(), &index, req).await.map_err(|e| format!("{:?}", e))
         }))
-        .route("/", get(|_req: axum::http::Request<axum::body::Body>| async move {
-            "OK"
+        .route("/", get(|_req: ()| async move {
+            Json(FrontendInit {
+                n_total: index_.read().await.vectors.ntotal(),
+                predefined_embedding_names: config__.predefined_embeddings.keys().cloned().collect()
+            })
         }))
-        .route("/reload", post(|_req: axum::http::Request<axum::body::Body>| async move {
+        .route("/reload", post(|_req: ()| async move {
             log::info!("Requesting index reload");
             let mut done_rx = done_tx.clone().subscribe();
             let _ = request_ingest_tx.send(()).await; // ignore possible error, which is presumably because the queue is full
@@ -911,7 +946,7 @@ async fn main() -> Result<()> {
                 }
             }
         }))
-        .route("/metrics", get(|_req: axum::http::Request<axum::body::Body>| async move {
+        .route("/metrics", get(|_req: ()| async move {
             let mut buffer = Vec::new();
             let encoder = prometheus::TextEncoder::new();
             let metric_families = prometheus::gather();

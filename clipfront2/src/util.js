@@ -1,4 +1,5 @@
 import * as config from "../../frontend_config.json"
+import { writable } from "svelte/store"
 
 export const getURL = x => config.image_path + x[1]
 
@@ -17,3 +18,9 @@ export const hasFormat = (results, result, format) => {
 export const thumbnailURL = (results, result, format) => {
     return `${config.thumb_path}${result[2]}${format}.${results.extensions[format]}`    
 }
+
+export let serverConfig = writable({})
+fetch(config.backend_url).then(x => x.json().then(x => {
+    serverConfig.set(x)
+    window.serverConfig = x
+}))

@@ -60,6 +60,8 @@
                 align-items: center
                 > *
                     margin: 0 2px
+        .sliders-ctrl
+            width: 5em
 
     .result
         border: 1px solid gray
@@ -70,6 +72,9 @@
 </style>
 
 <h1>Meme Search Engine</h1>
+{#if config.n_total}
+    <p>{config.n_total} items indexed.</p>
+{/if}
 <details>
     <summary>Usage tips</summary>
     <ul>
@@ -78,6 +83,7 @@
         <li>In certain circumstances, it may be useful to postfix your query with "meme".</li>
         <li>Capitalization is ignored.</li>
         <li>Only English is supported. Other languages might work slightly.</li>
+        <li>Sliders are generated from PCA on the index. The human-readable labels are approximate.</li>
     </ul>
 </details>
 <div class="controls">
@@ -98,12 +104,21 @@
                 {#if term.type === "embedding"}
                     <span>[embedding loaded from URL]</span>
                 {/if}
+                {#if term.type === "predefined_embedding"}
+                    <span>{term.predefinedEmbedding}</span>
+                {/if}
             </li>
         {/each}
     </ul>
     <div class="ctrlbar">
         <input type="search" placeholder="Text Query" on:keydown={handleKey} on:focus={newTextQuery}>
         <button on:click={pickFile}>Image Query</button>
+        <select bind:value={predefinedEmbeddingName} on:change={setPredefinedEmbedding} class="sliders-ctrl">
+            <option>Sliders</option>
+            {#each config.predefined_embedding_names ?? [] as name}
+                <option>{name}</option>
+            {/each}
+        </select>
         <button on:click={runSearch} style="margin-left: auto">Search</button>
     </div>
 </div>
@@ -150,6 +165,25 @@
 
     let queryTerms = []
     let queryCounter = 0
+
+    let config = {}
+    util.serverConfig.subscribe(x => {
+        config = x
+    })
+    let predefinedEmbeddingName = "Sliders"
+
+    const setPredefinedEmbedding = () => {
+        if (predefinedEmbeddingName !== "Sliders") {
+            queryTerms.push({
+                type: "predefined_embedding",
+                predefinedEmbedding: predefinedEmbeddingName,
+                sign: "+",
+                weight: 0.2
+            })
+        }
+        queryTerms = queryTerms
+        predefinedEmbeddingName = "Sliders"
+    }
 
     const decodeFloat16 = uint16 => {
         const sign = (uint16 & 0x8000) ? -1 : 1
@@ -200,7 +234,7 @@
     let displayedResults = []
     const runSearch = async () => {
         if (!resultPromise) {
-            let args = {"terms": queryTerms.map(x => ({ image: x.imageData, text: x.text, embedding: x.embedding, weight: x.weight * { "+": 1, "-": -1 }[x.sign] }))}
+            let args = {"terms": queryTerms.filter(x => x.text !== "").map(x => ({ image: x.imageData, text: x.text, embedding: x.embedding, predefined_embedding: x.predefinedEmbedding, weight: x.weight * { "+": 1, "-": -1 }[x.sign] }))}
             queryCounter += 1
             resultPromise = util.doQuery(args).then(res => {
                 error = null
