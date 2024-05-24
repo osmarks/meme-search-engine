@@ -34,3 +34,12 @@ tower = "0.4"
 json5 = "0.4"
 prometheus = "0.13"
 lazy_static = "1"
+zstd = "0.13"
+url = "2"
+fastrand = "2"
+mimalloc = "0.1"
+sonic-rs = "0.3"
+
+[[bin]]
+name = "reddit-dump"
+path = "src/reddit_dump.rs"

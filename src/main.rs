@@ -30,8 +30,10 @@ use prometheus::{register_int_counter, register_int_counter_vec, register_int_ga
 use ndarray::ArrayBase;
 
 mod ocr;
+mod common;
 
 use crate::ocr::scan_image;
+use crate::common::{InferenceServerConfig, resize_for_embed, EmbeddingRequest, get_backend_config, query_clip_server};
 
 lazy_static! {
     static ref RELOADS_COUNTER: IntCounter = register_int_counter!("mse_reloads", "reloads executed").unwrap();
@@ -126,35 +128,11 @@ struct FileRecord {
     thumbnails: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-struct InferenceServerConfig {
-    batch: usize,
-    image_size: (u32, u32),
-    embedding_size: usize,
-}
-
 #[derive(Debug, Clone)]
 struct WConfig {
     backend: InferenceServerConfig,
     service: Config,
     predefined_embeddings: HashMap<String, ArrayBase<ndarray::OwnedRepr<f32>, ndarray::prelude::Dim<[usize; 1]>>>
-}
-
-async fn query_clip_server<I, O>(
-    client: &Client,
-    config: &Config,
-    path: &str,
-    data: I,
-) -> Result<O> where I: Serialize, O: serde::de::DeserializeOwned,
-{
-    let response = client
-        .post(&format!("{}{}", config.clip_server, path))
-        .header("Content-Type", "application/msgpack")
-        .body(rmp_serde::to_vec_named(&data)?)
-        .send()
-        .await?;
-    let result: O = rmp_serde::from_slice(&response.bytes().await?)?;
-    Ok(result)
 }
 
 #[derive(Debug)]
@@ -168,13 +146,6 @@ struct LoadedImage {
 struct EmbeddingInput {
     image: Vec<u8>,
     filename: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum EmbeddingRequest {
-    Images { images: Vec<serde_bytes::ByteBuf> },
-    Text { text: Vec<String> }
 }
 
 fn timestamp() -> i64 {
@@ -274,21 +245,6 @@ fn image_formats(_config: &Config) -> HashMap<String, ImageFormatConfig> {
     formats
 }
 
-async fn resize_for_embed(config: Arc<WConfig>, image: Arc<DynamicImage>) -> Result<Vec<u8>> {
-    let resized = tokio::task::spawn_blocking(move || {
-        let new = image.resize(
-            config.backend.image_size.0,
-            config.backend.image_size.1,
-            FilterType::Lanczos3
-        );
-        let mut buf = Vec::new();
-        let mut csr = Cursor::new(&mut buf);
-        new.write_to(&mut csr, ImageFormat::Png)?;
-        Ok::<Vec<u8>, anyhow::Error>(buf)
-    }).await??;
-    Ok(resized)
-}
-
 async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
     let pool = initialize_database(&config.service).await?;
     let client = Client::new();
@@ -324,7 +280,7 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
                 };
                 IMAGES_LOADED_COUNTER.inc();
                 if record.embedding.is_none() {
-                    let resized = resize_for_embed(config.clone(), image.clone()).await?;
+                    let resized = resize_for_embed(config.backend.clone(), image.clone()).await?;
                     
                     to_embed_tx.send(EmbeddingInput { image: resized, filename: record.filename.clone() }).await?
                 }
@@ -505,7 +461,7 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
             async move {
                 let result: Vec<serde_bytes::ByteBuf> = query_clip_server(
                     &client,
-                    &config.service,
+                    &config.service.clip_server,
                     "",
                     EmbeddingRequest::Images {
                         images: batch.iter().map(|input| serde_bytes::ByteBuf::from(input.image.clone())).collect(),
@@ -753,7 +709,7 @@ async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IInde
             TERMS_COUNTER.get_metric_with_label_values(&["image"]).unwrap().inc();
             let bytes = BASE64_STANDARD.decode(image)?;
             let image = Arc::new(tokio::task::block_in_place(|| image::load_from_memory(&bytes))?);
-            image_batch.push(serde_bytes::ByteBuf::from(resize_for_embed(config.clone(), image).await?));
+            image_batch.push(serde_bytes::ByteBuf::from(resize_for_embed(config.backend.clone(), image).await?));
             image_weights.push(term.weight.unwrap_or(1.0));
         }
         if let Some(text) = &term.text {
@@ -792,7 +748,7 @@ async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IInde
     }
 
     for batch in batches {
-        let embs: Vec<Vec<u8>> = query_clip_server(&client, &config.service, "/", batch).await?;
+        let embs: Vec<Vec<u8>> = query_clip_server(&client, &config.service.clip_server, "/", batch).await?;
         for emb in embs {
             total_embedding += &ndarray::Array::from_vec(decode_fp16_buffer(&emb));
         }
@@ -813,11 +769,6 @@ async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IInde
     }).into_response())
 }
 
-async fn get_backend_config(config: &Config) -> Result<InferenceServerConfig> {
-    let res = Client::new().get(&format!("{}/config", config.clip_server)).send().await?;
-    Ok(rmp_serde::from_slice(&res.bytes().await?)?)
-}
-
 #[derive(Serialize, Deserialize)]
 struct FrontendInit {
     n_total: u64,
@@ -834,15 +785,7 @@ async fn main() -> Result<()> {
     let pool = initialize_database(&config).await?;
     sqlx::query(SCHEMA).execute(&pool).await?;
 
-    let backend = loop {
-        match get_backend_config(&config).await {
-            Ok(backend) => break backend,
-            Err(e) => {
-                log::error!("Backend failed (fetch): {}", e);
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        }
-    };
+    let backend = get_backend_config(&config.clip_server).await;
 
     let mut predefined_embeddings = HashMap::new();
 
