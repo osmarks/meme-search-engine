@@ -13,9 +13,15 @@ from prometheus_client import Counter, Histogram, REGISTRY, generate_latest
 import io
 import json
 import sys
-import torch
-from transformers import SiglipTokenizer, SiglipImageProcessor, T5TokenizerFast, SiglipTextConfig, SiglipVisionConfig
 import numpy
+import big_vision.models.proj.image_text.two_towers as model_mod
+import jax
+import jax.numpy as jnp
+import ml_collections
+import big_vision.pp.builder as pp_builder
+import big_vision.pp.ops_general
+import big_vision.pp.ops_image
+import big_vision.pp.ops_text
 
 with open(sys.argv[1], "r") as config_file:
     CONFIG = json.load(config_file)
@@ -96,6 +102,7 @@ def do_inference(params: InferenceParameters):
             with inference_time_hist.labels(MODELNAME + "-image", images.shape[0]).time():
                 features = run_image_model(images)
         batch_count_ctr.labels(MODELNAME).inc()
+        # TODO got to divide somewhere
         callback(True, numpy.asarray(features))
     except Exception as e:
         traceback.print_exc()

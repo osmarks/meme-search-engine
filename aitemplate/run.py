@@ -133,9 +133,7 @@ def benchmark(name, config, batch_size, mod=None, graph_mode=True):
     mod.set_many_constants_with_tensors(params_ait)
     mod.fold_constants(sync=True)
 
-    # prepare input/output tensor
-    s = torch.stack([image.cuda().half().permute((1, 2, 0)) for _ in range(batch_size)], dim=0)
-    inputs = [s] #[torch.randn([batch_size, config["img_size"], config["img_size"], 3]).cuda().half()]
+    inputs = [torch.randn([batch_size, config["img_size"], config["img_size"], 3]).cuda().half()]
     ys = []
     num_outputs = len(mod.get_output_name_to_index_map())
     for i in range(num_outputs):
@@ -149,10 +147,10 @@ def benchmark(name, config, batch_size, mod=None, graph_mode=True):
         repeat=1,
         graph_mode=graph_mode,
     )
-    q = model.visual.trunk.attn_pool(model.visual.trunk.norm(model.visual.trunk.blocks(model.visual.trunk.patch_embed(input) + model.visual.trunk.pos_embed)))
-    # = #model.visual.trunk.attn_pool.q(model.visual.trunk.attn_pool.latent.expand(batch_size, -1, -1)).reshape(batch_size, 1, 16, 72).transpose(1, 2)
-    print("expected", q, q.shape)
-    print("actual", ys[0], ys[0].shape)
+    #q = model.visual.trunk.attn_pool(model.visual.trunk.norm(model.visual.trunk.blocks(model.visual.trunk.patch_embed(input) + model.visual.trunk.pos_embed)))
+    ## = #model.visual.trunk.attn_pool.q(model.visual.trunk.attn_pool.latent.expand(batch_size, -1, -1)).reshape(batch_size, 1, 16, 72).transpose(1, 2)
+    #print("expected", q, q.shape)
+    #print("actual", ys[0], ys[0].shape)
     """
     batch = ys[0][:, 0, :]
     batch = torch.nn.functional.normalize(batch, dim=-1)
@@ -160,6 +158,6 @@ def benchmark(name, config, batch_size, mod=None, graph_mode=True):
     print(f"batch_size: {batch_size}, latency: {t}")
     """
 #for bs in (1, 2, 4, 8, 16, 32, 64, 128, 256):
-for bs in (batch_size,):
+for bs in (1, 2, 4, 8, 16, 32):
     compile_vit(siglip_so400m_384_14, bs, use_fp16_acc=True)
     benchmark("siglip_so400m_384_14", siglip_so400m_384_14, bs, graph_mode=True)

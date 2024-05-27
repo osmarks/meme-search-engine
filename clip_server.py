@@ -28,6 +28,59 @@ print("Model loaded")
 BS = CONFIG["max_batch_size"]
 MODELNAME = CONFIG["model_name"]
 
+fast_image_fns = {}
+# ugly hack, sorry
+if CONFIG.get("aitemplate_image_models"):
+    from aitemplate.compiler import Model
+    from aitemplate.testing import detect_target
+
+    USE_CUDA = detect_target().name() == "cuda"
+
+    state = model.state_dict()
+    conv_weights = state["visual.trunk.patch_embed.proj.weight"].permute((0, 2, 3, 1)).contiguous().cuda().half()
+
+    def load_pretrained():
+        params = {}
+        for key, value in state.items():
+            orig_key = key
+            if key.startswith("visual."):
+                key = key.removeprefix("visual.") \
+                    .replace("trunk.patch_embed", "patch_embed") \
+                    .replace("trunk.blocks", "encoder.layers") \
+                    .replace(".attn.", ".mha.") \
+                    .replace(".norm1.", ".ln1.") \
+                    .replace(".norm2.", ".ln2.") \
+                    .replace("trunk.pos_embed", "pos_emb_pos_emb") \
+                    .replace("trunk.norm.", "encoder.ln.") \
+                    .replace("trunk.attn_pool.latent", "pool.probe") \
+                    .replace("trunk.attn_pool", "pool") \
+                    .replace("pool.norm", "pool.ln")
+                if "patch_embed.proj.weight" not in key:
+                    params[key.replace(".", "_")] = value.cuda()
+                    #print(orig_key, key.replace(".", "_"))
+    
+        params["patch_embed_proj_weight"] = conv_weights
+
+        return params
+
+    def generate_wrapper(path):
+        ait_model = Model(path)
+        ait_model.set_many_constants_with_tensors(load_pretrained())
+        ait_model.fold_constants(sync=True)
+        def wrapper(batch):
+            xs = [batch.permute((0, 2, 3, 1)).contiguous()]
+            ys = []
+            for i in range(len(ait_model.get_output_name_to_index_map())):
+                shape = ait_model.get_output_maximum_shape(i)
+                ys.append(torch.empty(shape).cuda().half())
+            ait_model.run_with_tensors(xs, ys)
+            return ys[0][:, 0, :]
+        return wrapper
+
+    for batch_size, path in CONFIG["aitemplate_image_models"]:
+        fast_image_fns[batch_size] = generate_wrapper(path)
+        print("loaded", batch_size, path)
+
 InferenceParameters = collections.namedtuple("InferenceParameters", ["text", "images", "callback"])
 
 items_ctr = Counter("modelserver_total_items", "Items run through model server", ["model", "modality"])
@@ -48,7 +101,17 @@ def do_inference(params: InferenceParameters):
             elif images is not None:
                 with inference_time_hist.labels(MODELNAME + "-image", images.shape[0]).time():
                     items_ctr.labels(MODELNAME, "image").inc(images.shape[0])
-                    features = model.encode_image(images)
+                    batch = images.shape[0]
+                    if fast_image_fns:
+                        progress = 0
+                        features = torch.zeros((batch, model.text.text_projection.out_features))
+                        while progress < batch:
+                            biggest_available = max(x for x in fast_image_fns.keys() if x <= (batch - progress))
+                            chunk = fast_image_fns[biggest_available](images[progress:progress + biggest_available])
+                            features[progress:progress + biggest_available] = chunk
+                            progress += biggest_available
+                    else:
+                        features = model.encode_image(images)
                     features /= features.norm(dim=-1, keepdim=True)
                     features = features.cpu().numpy()
             batch_count_ctr.labels(MODELNAME).inc()
