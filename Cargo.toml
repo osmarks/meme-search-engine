@@ -40,6 +40,9 @@ fastrand = "2"
 mimalloc = "0.1"
 sonic-rs = "0.3"
 
+[patch.crates-io]
+image = { git = "https://github.com/fintelia/image/", branch = "upgrade-zune-jpeg" }
+
 [[bin]]
 name = "reddit-dump"
 path = "src/reddit_dump.rs"

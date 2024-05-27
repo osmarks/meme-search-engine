@@ -1122,8 +1122,7 @@ dependencies = [
 [[package]]
 name = "image"
 version = "0.25.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd54d660e773627692c524beaad361aca785a4f9f5730ce91f42aabe5bce3d11"
+source = "git+https://github.com/fintelia/image/?branch=upgrade-zune-jpeg#54ee15fae5f865f9806bda70c2118e9e572e7deb"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -1141,7 +1140,6 @@ dependencies = [
  "rayon",
  "rgb",
  "tiff",
- "zune-core",
  "zune-jpeg",
 ]
 
@@ -3550,9 +3548,9 @@ dependencies = [
 
 [[package]]
 name = "zune-core"
-version = "0.4.12"
+version = "0.5.0-rc1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f423a2c17029964870cfaabb1f13dfab7d092a62a29a89264f4d36990ca414a"
+checksum = "e0d1b427373b52a2497c49b0860a5290daab6a0437902ffd8f607367bd5eb7d0"
 
 [[package]]
 name = "zune-inflate"
@@ -3565,9 +3563,9 @@ dependencies = [
 
 [[package]]
 name = "zune-jpeg"
-version = "0.4.11"
+version = "0.5.0-rc1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec866b44a2a1fd6133d363f073ca1b179f438f99e7e5bfb1e33f7181facfe448"
+checksum = "e4019a3b4e46db2d81faab716e5034dd212f1e105bc55b3f5ca4381dd78736e0"
 dependencies = [
  "zune-core",
 ]
