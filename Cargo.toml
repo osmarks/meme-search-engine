@@ -39,6 +39,7 @@ url = "2"
 fastrand = "2"
 mimalloc = "0.1"
 sonic-rs = "0.3"
+ffmpeg-the-third = "2.0"
 
 [patch.crates-io]
 image = { git = "https://github.com/fintelia/image/", branch = "upgrade-zune-jpeg" }
@@ -46,3 +47,7 @@ image = { git = "https://github.com/fintelia/image/", branch = "upgrade-zune-jpe
 [[bin]]
 name = "reddit-dump"
 path = "src/reddit_dump.rs"
+
+[[bin]]
+name = "video-reader"
+path = "src/video_reader.rs"

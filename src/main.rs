@@ -6,7 +6,7 @@ use anyhow::{Result, Context};
 use axum::body::Body;
 use axum::response::Response;
 use axum::{
-    extract::Json,
+    extract::{Json, DefaultBodyLimit},
     response::IntoResponse,
     routing::{get, post},
     Router,
@@ -860,7 +860,7 @@ async fn main() -> Result<()> {
             let client = client.clone();
             QUERIES_COUNTER.inc();
             handle_request(config, client.clone(), &index, req).await.map_err(|e| format!("{:?}", e))
-        }))
+        }).layer(DefaultBodyLimit::max(2<<24)))
         .route("/", get(|_req: ()| async move {
             Json(FrontendInit {
                 n_total: index_.read().await.vectors.ntotal(),
