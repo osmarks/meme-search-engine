@@ -734,23 +734,23 @@ async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IInde
 
     if !image_batch.is_empty() {
         batches.push(
-            EmbeddingRequest::Images {
+            (EmbeddingRequest::Images {
                 images: image_batch
-            }
+            }, image_weights)
         );
     }
     if !text_batch.is_empty() {
         batches.push(
-            EmbeddingRequest::Text {
+            (EmbeddingRequest::Text {
                 text: text_batch,
-            }
+            }, text_weights)
         );
     }
 
-    for batch in batches {
+    for (batch, weights) in batches {
         let embs: Vec<Vec<u8>> = query_clip_server(&client, &config.service.clip_server, "/", batch).await?;
-        for emb in embs {
-            total_embedding += &ndarray::Array::from_vec(decode_fp16_buffer(&emb));
+        for (emb, weight) in embs.into_iter().zip(weights) {
+            total_embedding += &(ndarray::Array::from_vec(decode_fp16_buffer(&emb)) * weight);
         }
     }
 
