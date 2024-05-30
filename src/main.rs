@@ -14,7 +14,6 @@ use axum::{
     http::StatusCode
 };
 use common::resize_for_embed_sync;
-use ffmpeg_the_third::device::input::video;
 use image::RgbImage;
 use image::{imageops::FilterType, io::Reader as ImageReader, DynamicImage, ImageFormat};
 use reqwest::Client;
@@ -343,12 +342,14 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
                                     image: embed_buf,
                                     filename: Filename::VideoFrame(filename.clone(), i)
                                 })?;
-                                to_thumbnail_tx.blocking_send(LoadedImage {
-                                    image: frame.clone(),
-                                    filename: Filename::VideoFrame(filename.clone(), i),
-                                    original_size: None,
-                                    fast_thumbnails_only: true
-                                })?;
+                                if config.service.enable_thumbs {
+                                    to_thumbnail_tx.blocking_send(LoadedImage {
+                                        image: frame.clone(),
+                                        filename: Filename::VideoFrame(filename.clone(), i),
+                                        original_size: None,
+                                        fast_thumbnails_only: true
+                                    })?;
+                                }
                                 i += 1;
                                 Ok(())
                             };
@@ -378,23 +379,23 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
                 }
                 if record.needs_thumbnail {
                     to_thumbnail_tx
-                    .send(LoadedImage {
-                        image: image.clone(),
-                        filename: Filename::Actual(record.filename.clone()),
-                        original_size: Some(std::fs::metadata(&path)?.len() as usize),
-                        fast_thumbnails_only: false
-                    })
-                    .await?;
+                        .send(LoadedImage {
+                            image: image.clone(),
+                            filename: Filename::Actual(record.filename.clone()),
+                            original_size: Some(std::fs::metadata(&path)?.len() as usize),
+                            fast_thumbnails_only: false
+                        })
+                        .await?;
                 }
                 if record.needs_ocr {
                     to_ocr_tx
-                    .send(LoadedImage {
-                        image,
-                        filename: Filename::Actual(record.filename.clone()),
-                        original_size: None,
-                        fast_thumbnails_only: true
-                    })
-                    .await?;
+                        .send(LoadedImage {
+                            image,
+                            filename: Filename::Actual(record.filename.clone()),
+                            original_size: None,
+                            fast_thumbnails_only: true
+                        })
+                        .await?;
                 }
                 Ok(())
             }
@@ -634,8 +635,8 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
             None => Some(FileRecord {
                 filename: filename.clone(),
                 needs_embed: true,
-                needs_ocr: true,
-                needs_thumbnail: true
+                needs_ocr: config.service.enable_ocr,
+                needs_thumbnail: config.service.enable_thumbs
             }),
             Some(r) => {
                 let needs_embed = modtime > r.embedding_time.unwrap_or(i64::MIN);

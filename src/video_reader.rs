@@ -2,7 +2,7 @@ extern crate ffmpeg_the_third as ffmpeg;
 use anyhow::{Result, Context};
 use image::RgbImage;
 use std::env;
-use ffmpeg::{codec, filter, format::{self, Pixel}, media::Type, util::frame::video::Video};
+use ffmpeg::{codec, filter, format::{self, Pixel}, media::Type, util::frame::video::Video, software::scaling};
 
 const BYTES_PER_PIXEL: usize = 3;
 
@@ -20,7 +20,11 @@ pub fn run<P: AsRef<std::path::Path>, F: FnMut(RgbImage) -> Result<()>>(path: P,
     graph.add(&filter::find("buffer").unwrap(), "in", 
         &format!("video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}", decoder.width(), decoder.height(), decoder.format().descriptor().unwrap().name(), video.time_base().0, video.time_base().1, decoder.aspect_ratio().0, decoder.aspect_ratio().1))?;
     graph.add(&filter::find("buffersink").unwrap(), "out", "")?;
-    graph.output("in", 0)?.input("out", 0)?.parse(&format!("[in] thumbnail=n={}:log=verbose [thumbs]; [thumbs] select='gt(scene,0.05)+eq(n,0)' [out]", afr)).context("filtergraph parse failed")?;
+    // I don't know exactly where, but some of my videos apparently have the size vary throughout them.
+    // This causes horrible segfaults somewhere.
+    // Rescale to initial width to fix this. We could do this with a separate swscaler but this is easier.
+    let filterspec = format!("[in] scale={}:{} [scaled]; [scaled] thumbnail=n={}:log=verbose [thumbs]; [thumbs] select='gt(scene,0.05)+eq(n,0)' [out]", decoder.width(), decoder.height(), afr);
+    graph.output("in", 0)?.input("out", 0)?.parse(&filterspec).context("filtergraph parse failed")?;
     let mut out = graph.get("out").unwrap();
     out.set_pixel_format(Pixel::RGB24);
 
@@ -33,6 +37,7 @@ pub fn run<P: AsRef<std::path::Path>, F: FnMut(RgbImage) -> Result<()>>(path: P,
             if !decoder.receive_frame(&mut decoded).is_ok() { break }
 
             let mut in_ctx = filter_graph.get("in").unwrap();
+            // The filters really do not like 
             let mut src = in_ctx.source();
             src.add(&decoded).context("add frame")?;
             

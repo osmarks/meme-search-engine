@@ -140,7 +140,7 @@
                 <div class="result">
                     <a href={util.getURL(result)}>
                         {#if util.hasFormat(results, result, "VIDEO")}
-                            <video controls poster={util.thumbnailURL(results, result, "jpegh")} preload="metadata" on:loadstart={updateCounter} on:loadedmetadata={redrawGrid}>
+                            <video controls poster={util.hasFormat("jpegh") ? util.thumbnailURL(results, result, "jpegh") : null} preload="metadata" on:loadstart={updateCounter} on:loadedmetadata={redrawGrid} on:loadeddata={redrawGrid}>
                                 <source src={util.getURL(result)} />
                             </video>
                         {:else}
