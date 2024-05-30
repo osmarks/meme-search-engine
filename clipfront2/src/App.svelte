@@ -67,7 +67,7 @@
         border: 1px solid gray
         *
             display: block
-    .result img
+    .result img, .result video
         width: 100%
 </style>
 
@@ -84,6 +84,7 @@
         <li>Capitalization is ignored.</li>
         <li>Only English is supported. Other languages might work slightly.</li>
         <li>Sliders are generated from PCA on the index. The human-readable labels are approximate.</li>
+        <li>Want your own deployment? Use the open-source code on <a href="https://github.com/osmarks/meme-search-engine/">GitHub.</a>.</li>
     </ul>
 </details>
 <div class="controls">
@@ -138,15 +139,21 @@
             {#key `${queryCounter}${result.file}`}
                 <div class="result">
                     <a href={util.getURL(result)}>
-                        <picture>
-                            {#if util.hasFormat(results, result, "avifl")}
-                                <source srcset={util.thumbnailURL(results, result, "avifl") + (util.hasFormat(results, result, "avifh") ? ", " + util.thumbnailURL(results, result, "avifh") + " 2x" : "")} type="image/avif" />
-                            {/if}
-                            {#if util.hasFormat(results, result, "jpegl")}
-                                <source srcset={util.thumbnailURL(results, result, "jpegl") + (util.hasFormat(results, result, "jpegh") ? ", " + util.thumbnailURL(results, result, "jpegh") + " 2x" : "")} type="image/jpeg" />
-                            {/if}
-                            <img src={util.getURL(result)} on:load={updateCounter} on:error={updateCounter} alt={result[1]}>
-                        </picture>
+                        {#if util.hasFormat(results, result, "VIDEO")}
+                            <video controls poster={util.thumbnailURL(results, result, "jpegh")} preload="metadata" on:loadstart={updateCounter} on:loadedmetadata={redrawGrid}>
+                                <source src={util.getURL(result)} />
+                            </video>
+                        {:else}
+                            <picture>
+                                {#if util.hasFormat(results, result, "avifl")}
+                                    <source srcset={util.thumbnailURL(results, result, "avifl") + (util.hasFormat(results, result, "avifh") ? ", " + util.thumbnailURL(results, result, "avifh") + " 2x" : "")} type="image/avif" />
+                                {/if}
+                                {#if util.hasFormat(results, result, "jpegl")}
+                                    <source srcset={util.thumbnailURL(results, result, "jpegl") + (util.hasFormat(results, result, "jpegh") ? ", " + util.thumbnailURL(results, result, "jpegh") + " 2x" : "")} type="image/jpeg" />
+                                {/if}
+                                <img src={util.getURL(result)} on:load={updateCounter} on:error={updateCounter} alt={result[1]}>
+                            </picture>
+                        {/if}
                     </a>
                 </div>
             {/key}
@@ -240,7 +247,10 @@
     let displayedResults = []
     const runSearch = async () => {
         if (!resultPromise) {
-            let args = {"terms": queryTerms.filter(x => x.text !== "").map(x => ({ image: x.imageData, text: x.text, embedding: x.embedding, predefined_embedding: x.predefinedEmbedding, weight: x.weight * { "+": 1, "-": -1 }[x.sign] }))}
+            let args = {
+                "terms": queryTerms.filter(x => x.text !== "").map(x => ({ image: x.imageData, text: x.text, embedding: x.embedding, predefined_embedding: x.predefinedEmbedding, weight: x.weight * { "+": 1, "-": -1 }[x.sign] })),
+                "include_video": true
+            }
             queryCounter += 1
             resultPromise = util.doQuery(args).then(res => {
                 error = null

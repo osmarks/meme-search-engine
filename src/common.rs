@@ -12,18 +12,20 @@ pub struct InferenceServerConfig {
     pub embedding_size: usize,
 }
 
+pub fn resize_for_embed_sync<T: Borrow<DynamicImage> + Send + 'static>(config: InferenceServerConfig, image: T) -> Result<Vec<u8>> {
+    let new = image.borrow().resize(
+        config.image_size.0,
+        config.image_size.1,
+        FilterType::Lanczos3
+    );
+    let mut buf = Vec::new();
+    let mut csr = Cursor::new(&mut buf);
+    new.write_to(&mut csr, ImageFormat::Png)?;
+    Ok::<Vec<u8>, anyhow::Error>(buf)
+}
+
 pub async fn resize_for_embed<T: Borrow<DynamicImage> + Send + 'static>(config: InferenceServerConfig, image: T) -> Result<Vec<u8>> {
-    let resized = tokio::task::spawn_blocking(move || {
-        let new = image.borrow().resize(
-            config.image_size.0,
-            config.image_size.1,
-            FilterType::Lanczos3
-        );
-        let mut buf = Vec::new();
-        let mut csr = Cursor::new(&mut buf);
-        new.write_to(&mut csr, ImageFormat::Png)?;
-        Ok::<Vec<u8>, anyhow::Error>(buf)
-    }).await??;
+    let resized = tokio::task::spawn_blocking(move || resize_for_embed_sync(config, image)).await??;
     Ok(resized)
 }
 
