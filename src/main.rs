@@ -14,6 +14,7 @@ use axum::{
     http::StatusCode
 };
 use common::resize_for_embed_sync;
+use compact_str::CompactString;
 use image::RgbImage;
 use image::{imageops::FilterType, io::Reader as ImageReader, DynamicImage, ImageFormat};
 use reqwest::Client;
@@ -122,7 +123,7 @@ struct RawFileRecord {
 
 #[derive(Debug, Clone)]
 struct FileRecord {
-    filename: String,
+    filename: CompactString,
     needs_embed: bool,
     needs_ocr: bool,
     needs_thumbnail: bool
@@ -145,8 +146,8 @@ struct LoadedImage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 enum Filename {
-    Actual(String),
-    VideoFrame(String, u64)
+    Actual(CompactString),
+    VideoFrame(CompactString, u64)
 }
 
 // this is a somewhat horrible hack, but probably nobody has NUL bytes at the start of filenames?
@@ -154,7 +155,7 @@ impl Filename {
     fn decode(buf: Vec<u8>) -> Result<Self> {
         Ok(match buf.strip_prefix(&[0]) {
             Some(remainder) => rmp_serde::from_read(&*remainder)?,
-            None => Filename::Actual(String::from_utf8(buf)?.to_string())
+            None => Filename::Actual(CompactString::from_utf8(buf)?)
         })
     }
 
@@ -325,7 +326,7 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
             let to_ocr_tx = to_ocr_tx.clone();
             let video_lengths = video_lengths.clone();
             async move {
-                let path = Path::new(&config.service.files).join(&record.filename);
+                let path = Path::new(&config.service.files).join(&*record.filename);
                 let image: Result<Arc<DynamicImage>> = tokio::task::block_in_place(|| Ok(Arc::new(ImageReader::open(&path)?.with_guessed_format()?.decode()?)));
                 let image = match image {
                     Ok(image) => image,
@@ -490,7 +491,7 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
                     let mut conn = pool.acquire().await?;
                     ensure_filename_record_exists(&mut conn, &filename_enc).await?;
                     match filename {
-                        Filename::VideoFrame(container, _) => { video_thumb_times.write().await.insert(container.to_string(), timestamp()); },
+                        Filename::VideoFrame(container, _) => { video_thumb_times.write().await.insert(container.clone(), timestamp()); },
                         _ => ()
                     }
                     sqlx::query!(
@@ -588,7 +589,7 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
                     IMAGES_EMBEDDED_COUNTER.inc();
                     ensure_filename_record_exists(&mut *tx, &encoded_filename).await?;
                     match &batch[i].filename {
-                        Filename::VideoFrame(container, _) => { video_embed_times.write().await.insert(container.to_string(), timestamp()); },
+                        Filename::VideoFrame(container, _) => { video_embed_times.write().await.insert(container.clone(), timestamp()); },
                         _ => ()
                     }
                     sqlx::query!(
@@ -614,7 +615,7 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
             let entry = entry?;
             let path = entry.path();
             if path.is_file() {
-                let filename = path.strip_prefix(&config.service.files)?.to_str().unwrap().to_string();
+                let filename = CompactString::from(path.strip_prefix(&config.service.files)?.to_str().unwrap());
                 let modtime = entry.metadata()?.modified()?.duration_since(std::time::UNIX_EPOCH)?;
                 let modtime = modtime.as_micros() as i64;
                 actual_filenames.insert(filename.clone(), (path.to_path_buf(), modtime));
@@ -627,7 +628,8 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
 
     for (filename, (_path, modtime)) in actual_filenames.iter() {
         let modtime = *modtime;
-        let record = sqlx::query_as!(RawFileRecord, "SELECT * FROM files WHERE filename = ?", filename)
+        let filename_arr = filename.as_bytes();
+        let record = sqlx::query_as!(RawFileRecord, "SELECT * FROM files WHERE filename = ?", filename_arr)
             .fetch_optional(&pool)
             .await?;
 
@@ -681,10 +683,14 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
     for filename in stored {
         let parsed_filename = Filename::decode(filename.clone())?;
         match parsed_filename {
-            Filename::Actual(s) => if !actual_filenames.contains_key(&s) {
-                sqlx::query!("DELETE FROM files WHERE filename = ?", s)
-                    .execute(&mut *tx)
-                    .await?;
+            Filename::Actual(s) => {
+                let s = &*s;
+                let raw = &filename;
+                if !actual_filenames.contains_key(s) {
+                    sqlx::query!("DELETE FROM files WHERE filename = ?", raw)
+                        .execute(&mut *tx)
+                        .await?;
+                }
             },
             // This might fail in some cases where for whatever reason a video is replaced with a file of the same name which is not a video. Don't do that.
             Filename::VideoFrame(container, frame) => if !actual_filenames.contains_key(&container) {
@@ -704,6 +710,7 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
     for container_filename in video_lengths.keys() {
         let embed_time = video_embed_times.get(container_filename);
         let thumb_time = video_thumb_times.get(container_filename);
+        let container_filename: &[u8] = container_filename.as_bytes();
         sqlx::query!("INSERT OR REPLACE INTO files (filename, embedding_time, thumbnail_time) VALUES (?, ?, ?)", container_filename, embed_time, thumb_time)
             .execute(&mut *tx)
             .await?;

@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = "0.7"
-image = { version = "0.25", features = ["avif", "avif-native"] }
+image = { version = "0.25", features = ["avif", "avif-native", "nasm"] }
 reqwest = { version = "0.12", features = ["multipart"] }
 serde = { version = "1", features = ["derive"] }
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
@@ -40,6 +40,7 @@ fastrand = "2"
 mimalloc = "0.1"
 sonic-rs = "0.3"
 ffmpeg-the-third = "2.0"
+compact_str = { version = "0.8.0-beta", features = ["serde"] }
 
 [patch.crates-io]
 image = { git = "https://github.com/fintelia/image/", branch = "upgrade-zune-jpeg" }

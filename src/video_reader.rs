@@ -2,7 +2,7 @@ extern crate ffmpeg_the_third as ffmpeg;
 use anyhow::{Result, Context};
 use image::RgbImage;
 use std::env;
-use ffmpeg::{codec, filter, format::{self, Pixel}, media::Type, util::frame::video::Video, software::scaling};
+use ffmpeg::{codec, filter, format::{self, Pixel}, media::Type, util::frame::video::Video};
 
 const BYTES_PER_PIXEL: usize = 3;
 
