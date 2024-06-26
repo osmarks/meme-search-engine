@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE files SET metadata = ? WHERE filename = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "de6df63baa6ab4102d815e8d84bc4e14cd25c2d08ea2b2731bd640be6539edce"
+}

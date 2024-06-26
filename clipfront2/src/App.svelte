@@ -137,7 +137,7 @@
     <Masonry bind:refreshLayout={refreshLayout} colWidth="minmax(Min(20em, 100%), 1fr)" items={displayedResults}>
         {#each displayedResults as result}
             {#key `${queryCounter}${result.file}`}
-                <div class="result">
+                <div class="result" style={aspectRatio(result)}>
                     <a href={util.getURL(result)}>
                         {#if util.hasFormat(results, result, "VIDEO")}
                             <video controls poster={util.hasFormat(results, result, "jpegh") ? util.thumbnailURL(results, result, "jpegh") : null} preload="metadata" on:loadstart={updateCounter} on:loadedmetadata={redrawGrid} on:loadeddata={redrawGrid}>
@@ -197,6 +197,8 @@
         if (snd === undefined) return "Not " + fst
         return `${snd}/${fst}`
     }
+
+    const aspectRatio = result => result[4] ? `aspect-ratio: ${result[4][0]}/${result[4][1]}` : null
 
     const decodeFloat16 = uint16 => {
         const sign = (uint16 & 0x8000) ? -1 : 1

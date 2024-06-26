@@ -9,3 +9,4 @@ node_modules/*
 node_modules
 *sqlite3*
 thumbtemp
+mse-test-db-small

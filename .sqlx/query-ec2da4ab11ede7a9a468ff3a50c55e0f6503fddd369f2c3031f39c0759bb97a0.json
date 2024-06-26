@@ -42,6 +42,11 @@
         "name": "thumbnails",
         "ordinal": 7,
         "type_info": "Blob"
+      },
+      {
+        "name": "metadata",
+        "ordinal": 8,
+        "type_info": "Blob"
       }
     ],
     "parameters": {
@@ -49,6 +54,7 @@
     },
     "nullable": [
       false,
+      true,
       true,
       true,
       true,

@@ -58,6 +58,7 @@ lazy_static! {
 }
 
 fn function_which_returns_50() -> usize { 50 }
+fn function_which_will_return_the_integer_one_successor_of_zero_but_as_a_float() -> f32 { 1.0 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct Config {
@@ -74,7 +75,9 @@ struct Config {
     #[serde(default="function_which_returns_50")]
     ocr_concurrency: usize,
     #[serde(default)]
-    no_run_server: bool
+    no_run_server: bool,
+    #[serde(default="function_which_will_return_the_integer_one_successor_of_zero_but_as_a_float")]
+    video_frame_interval: f32
 }
 
 #[derive(Debug)]
@@ -83,9 +86,11 @@ struct IIndex {
     filenames: Vec<Filename>,
     format_codes: Vec<u64>,
     format_names: Vec<String>,
+    metadata: Vec<Option<FileMetadata>>
 }
 
-const SCHEMA: &str = r#"
+const SCHEMA: &[&str] = &[
+r#"
 CREATE TABLE IF NOT EXISTS files (
     filename TEXT NOT NULL PRIMARY KEY,
     embedding_time INTEGER,
@@ -106,7 +111,17 @@ DROP TRIGGER IF EXISTS ocr_fts_upd;
 DROP TRIGGER IF EXISTS ocr_fts_ins;
 DROP TRIGGER IF EXISTS ocr_fts_del;
 DROP TABLE IF EXISTS ocr_fts;
-"#;
+"#,
+r#"
+ALTER TABLE files ADD COLUMN metadata BLOB;
+"#];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileMetadata {
+    width: u32,
+    height: u32,
+    frames: Option<u32>
+}
 
 #[derive(Debug, sqlx::FromRow, Clone)]
 struct RawFileRecord {
@@ -119,6 +134,7 @@ struct RawFileRecord {
     ocr: Option<String>,
     raw_ocr_segments: Option<Vec<u8>>,
     thumbnails: Option<Vec<u8>>,
+    metadata: Option<Vec<u8>>
 }
 
 #[derive(Debug, Clone)]
@@ -126,7 +142,8 @@ struct FileRecord {
     filename: CompactString,
     needs_embed: bool,
     needs_ocr: bool,
-    needs_thumbnail: bool
+    needs_thumbnail: bool,
+    needs_metadata: bool
 }
 
 #[derive(Debug, Clone)]
@@ -140,14 +157,14 @@ struct WConfig {
 struct LoadedImage {
     image: Arc<DynamicImage>,
     filename: Filename,
-    original_size: Option<usize>,
+    original_filesize: Option<usize>,
     fast_thumbnails_only: bool
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 enum Filename {
     Actual(CompactString),
-    VideoFrame(CompactString, u64)
+    VideoFrame(CompactString, u32)
 }
 
 // this is a somewhat horrible hack, but probably nobody has NUL bytes at the start of filenames?
@@ -226,7 +243,17 @@ async fn initialize_database(config: &Config) -> Result<SqlitePool> {
     .filename(&config.db_path)
     .create_if_missing(true);
     let pool = SqlitePool::connect_with(connection_options).await?;
-    sqlx::query(SCHEMA).execute(&pool).await?;
+    let mut tx = pool.begin().await?;
+    let version = sqlx::query_scalar!("PRAGMA user_version").fetch_one(&mut *tx).await?.unwrap();
+    for (index, sql) in SCHEMA.iter().enumerate() {
+        if (index as i32) < version {
+            continue
+        }
+        log::info!("Migrating to DB version {}", index);
+        sqlx::query(sql).execute(&mut *tx).await?;
+        sqlx::query(&format!("PRAGMA user_version = {}", index + 1)).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
     Ok(pool)
 }
 
@@ -297,6 +324,15 @@ async fn ensure_filename_record_exists(conn: &mut SqliteConnection, filename_enc
     Ok(())
 }
 
+async fn write_metadata(conn: &mut SqliteConnection, filename_enc: &Vec<u8>, metadata: FileMetadata) -> Result<()> {
+    ensure_filename_record_exists(conn, filename_enc).await?;
+    let metadata_serialized = rmp_serde::to_vec_named(&metadata)?;
+    sqlx::query!("UPDATE files SET metadata = ? WHERE filename = ?", metadata_serialized, filename_enc)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
     let pool = initialize_database(&config.service).await?;
     let client = Client::new();
@@ -307,24 +343,26 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
     let (to_embed_tx, to_embed_rx) = mpsc::channel(config.backend.batch as usize);
     let (to_thumbnail_tx, to_thumbnail_rx) = mpsc::channel(30);
     let (to_ocr_tx, to_ocr_rx) = mpsc::channel(30);
+    let (to_metadata_write_tx, mut to_metadata_write_rx) = mpsc::channel::<(Filename, FileMetadata)>(100);
     
     let cpus = num_cpus::get();
 
-    let video_lengths = Arc::new(RwLock::new(HashMap::new()));
+    let video_meta = Arc::new(RwLock::new(HashMap::new()));
     let video_thumb_times = Arc::new(RwLock::new(HashMap::new()));
     let video_embed_times = Arc::new(RwLock::new(HashMap::new()));
 
     // Image loading and preliminary resizing
     let image_loading: JoinHandle<Result<()>> = tokio::spawn({
         let config = config.clone();
-        let video_lengths = video_lengths.clone();
+        let video_meta = video_meta.clone();
         let stream = ReceiverStream::new(to_process_rx).map(Ok);
         stream.try_for_each_concurrent(Some(cpus), move |record| {
             let config = config.clone();
             let to_embed_tx = to_embed_tx.clone();
             let to_thumbnail_tx = to_thumbnail_tx.clone();
             let to_ocr_tx = to_ocr_tx.clone();
-            let video_lengths = video_lengths.clone();
+            let video_meta = video_meta.clone();
+            let to_metadata_write_tx = to_metadata_write_tx.clone();
             async move {
                 let path = Path::new(&config.service.files).join(&*record.filename);
                 let image: Result<Arc<DynamicImage>> = tokio::task::block_in_place(|| Ok(Arc::new(ImageReader::open(&path)?.with_guessed_format()?.decode()?)));
@@ -334,56 +372,74 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
                         log::warn!("Could not read {} as image: {}", record.filename, e);
                         let filename = record.filename.clone();
                         IMAGES_LOADED_ERROR_COUNTER.inc();
-                        let video_length = tokio::task::spawn_blocking(move || -> Result<Option<u64>> {
-                            let mut i = 0;
+                        let meta = tokio::task::spawn_blocking(move || -> Result<Option<FileMetadata>> {
+                            let mut i: u32 = 0;
+                            let mut last_metadata = None;
                             let callback = |frame: RgbImage| {
                                 let frame: Arc<DynamicImage> = Arc::new(frame.into());
                                 let embed_buf = resize_for_embed_sync(config.backend.clone(), frame.clone())?;
+                                let filename = Filename::VideoFrame(filename.clone(), i);
                                 to_embed_tx.blocking_send(EmbeddingInput {
                                     image: embed_buf,
-                                    filename: Filename::VideoFrame(filename.clone(), i)
+                                    filename: filename.clone()
                                 })?;
+                                let meta = FileMetadata {
+                                    height: frame.height(),
+                                    width: frame.width(),
+                                    frames: Some(i + 1)
+                                };
+                                last_metadata = Some(meta.clone());
+                                to_metadata_write_tx.blocking_send((filename.clone(), meta))?;
                                 if config.service.enable_thumbs {
                                     to_thumbnail_tx.blocking_send(LoadedImage {
                                         image: frame.clone(),
-                                        filename: Filename::VideoFrame(filename.clone(), i),
-                                        original_size: None,
+                                        filename,
+                                        original_filesize: None,
                                         fast_thumbnails_only: true
                                     })?;
                                 }
                                 i += 1;
                                 Ok(())
                             };
-                            match video_reader::run(&path, callback) {
+                            match video_reader::run(&path, callback, config.service.video_frame_interval) {
                                 Ok(()) => {
                                     VIDEOS_LOADED_COUNTER.inc();
-                                    return anyhow::Result::Ok(Some(i))
+                                    return anyhow::Result::Ok(last_metadata)
                                 },
                                 Err(e) => {
                                     log::error!("Could not read {} as video: {}", filename, e);
                                     VIDEOS_LOADED_ERROR_COUNTER.inc();
                                 }
                             }
-                            return anyhow::Result::Ok(None)
+                            return anyhow::Result::Ok(last_metadata)
                         }).await??;
-                        if let Some(length) = video_length {
-                            video_lengths.write().await.insert(record.filename, length);
+                        if let Some(meta) = meta {
+                            video_meta.write().await.insert(record.filename, meta);
                         }
                         return Ok(())
                     }
                 };
+                let filename = Filename::Actual(record.filename);
+                if record.needs_metadata {
+                    let metadata = FileMetadata {
+                        width: image.width(),
+                        height: image.height(),
+                        frames: None
+                    };
+                    to_metadata_write_tx.send((filename.clone(), metadata)).await?;
+                }
                 IMAGES_LOADED_COUNTER.inc();
                 if record.needs_embed {
                     let resized = resize_for_embed(config.backend.clone(), image.clone()).await?;
                     
-                    to_embed_tx.send(EmbeddingInput { image: resized, filename: Filename::Actual(record.filename.clone()) }).await?
+                    to_embed_tx.send(EmbeddingInput { image: resized, filename: filename.clone() }).await?
                 }
                 if record.needs_thumbnail {
                     to_thumbnail_tx
                         .send(LoadedImage {
                             image: image.clone(),
-                            filename: Filename::Actual(record.filename.clone()),
-                            original_size: Some(std::fs::metadata(&path)?.len() as usize),
+                            filename: filename.clone(),
+                            original_filesize: Some(std::fs::metadata(&path)?.len() as usize),
                             fast_thumbnails_only: false
                         })
                         .await?;
@@ -392,8 +448,8 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
                     to_ocr_tx
                         .send(LoadedImage {
                             image,
-                            filename: Filename::Actual(record.filename.clone()),
-                            original_size: None,
+                            filename: filename.clone(),
+                            original_filesize: None,
                             fast_thumbnails_only: true
                         })
                         .await?;
@@ -403,7 +459,16 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
         })
     });
     
-    // Thumbnail generation
+    let metadata_writer: JoinHandle<Result<()>> = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            while let Some((filename, metadata)) = to_metadata_write_rx.recv().await {
+                write_metadata(&mut *pool.acquire().await?, &filename.encode()?, metadata).await?;
+            }
+            Ok(())
+        }
+    });
+    
     let thumbnail_generation: Option<JoinHandle<Result<()>>> = if config.service.enable_thumbs {
         let config = config.clone();
         let pool = pool.clone();
@@ -469,7 +534,7 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
                                 }?;
                                 buf
                             };
-                            if resized.len() < image.original_size.unwrap_or(usize::MAX) {
+                            if resized.len() < image.original_filesize.unwrap_or(usize::MAX) {
                                 generated_formats.push(format_name.clone());
                                 let thumbnail_path = Path::new(&config.service.thumbs_path).join(
                                     generate_thumbnail_filename(
@@ -510,7 +575,6 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
         None
     };
     
-    // OCR
     // TODO: save OCR errors and don't retry
     let ocr: Option<JoinHandle<Result<()>>> = if config.service.enable_ocr {
         let client = client.clone();
@@ -638,16 +702,18 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
                 filename: filename.clone(),
                 needs_embed: true,
                 needs_ocr: config.service.enable_ocr,
-                needs_thumbnail: config.service.enable_thumbs
+                needs_thumbnail: config.service.enable_thumbs,
+                needs_metadata: true
             }),
             Some(r) => {
                 let needs_embed = modtime > r.embedding_time.unwrap_or(i64::MIN);
                 let needs_ocr = modtime > r.ocr_time.unwrap_or(i64::MIN) && config.service.enable_ocr;
                 let needs_thumbnail = modtime > r.thumbnail_time.unwrap_or(i64::MIN) && config.service.enable_thumbs;
-                if needs_embed || needs_ocr || needs_thumbnail {
+                let needs_metadata = modtime > r.embedding_time.unwrap_or(i64::MIN) || r.metadata.is_none(); // we don't store metadata acquisition time so assume it happens roughly when embedding does
+                if needs_embed || needs_ocr || needs_thumbnail || needs_metadata {
                     Some(FileRecord {
                         filename: filename.clone(),
-                        needs_embed, needs_ocr, needs_thumbnail
+                        needs_embed, needs_ocr, needs_thumbnail, needs_metadata
                     })
                 } else {
                     None
@@ -666,6 +732,7 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
     drop(to_process_tx);
     
     embedding_generation.await?.context("generating embeddings")?;
+    metadata_writer.await?.context("writing metadata")?;
     
     if let Some(thumbnail_generation) = thumbnail_generation {
         thumbnail_generation.await?.context("generating thumbnails")?;
@@ -679,7 +746,7 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
     
     let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT filename FROM files").fetch_all(&pool).await?;
     let mut tx = pool.begin().await?;
-    let video_lengths = video_lengths.read().await;
+    let video_meta = video_meta.read().await;
     for filename in stored {
         let parsed_filename = Filename::decode(filename.clone())?;
         match parsed_filename {
@@ -693,13 +760,12 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
                 }
             },
             // This might fail in some cases where for whatever reason a video is replaced with a file of the same name which is not a video. Don't do that.
-            Filename::VideoFrame(container, frame) => if !actual_filenames.contains_key(&container) {
-                if let Some(length) = video_lengths.get(&container) {
-                    if frame > *length {
-                        sqlx::query!("DELETE FROM files WHERE filename = ?", filename)
-                            .execute(&mut *tx)
-                            .await?;
-                    }
+            Filename::VideoFrame(container, frame) => {
+                // We don't necessarily have video lengths accessible, but any time a video is modified they will be available.
+                if !actual_filenames.contains_key(&container) || frame > video_meta.get(&container).map(|x| x.frames.unwrap()).unwrap_or(u32::MAX) {
+                    sqlx::query!("DELETE FROM files WHERE filename = ?", filename)
+                        .execute(&mut *tx)
+                        .await?;
                 }
             }
         }
@@ -707,11 +773,12 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
 
     let video_thumb_times = video_thumb_times.read().await;
     let video_embed_times = video_embed_times.read().await;
-    for container_filename in video_lengths.keys() {
+    for (container_filename, metadata) in video_meta.iter() {
         let embed_time = video_embed_times.get(container_filename);
         let thumb_time = video_thumb_times.get(container_filename);
         let container_filename: &[u8] = container_filename.as_bytes();
-        sqlx::query!("INSERT OR REPLACE INTO files (filename, embedding_time, thumbnail_time) VALUES (?, ?, ?)", container_filename, embed_time, thumb_time)
+        let metadata = rmp_serde::to_vec_named(metadata)?;
+        sqlx::query!("INSERT OR REPLACE INTO files (filename, embedding_time, thumbnail_time, metadata) VALUES (?, ?, ?, ?)", container_filename, embed_time, thumb_time, metadata)
             .execute(&mut *tx)
             .await?;
     }
@@ -733,6 +800,7 @@ async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
         filenames: Vec::new(),
         format_codes: Vec::new(),
         format_names: Vec::new(),
+        metadata: Vec::new()
     };
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
@@ -772,6 +840,12 @@ async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
             if let Some(t) = record.thumbnails {
                 formats = rmp_serde::from_slice(&t)?;
             }
+
+            if let Some(m) = record.metadata {
+                index.metadata.push(Some(rmp_serde::from_slice(&m)?));
+            } else {
+                index.metadata.push(None);
+            }
             
             for format_string in &formats {
                 let mut found = false;
@@ -808,7 +882,7 @@ type EmbeddingVector = Vec<f32>;
 
 #[derive(Debug, Serialize)]
 struct QueryResult {
-    matches: Vec<(f32, String, String, u64)>,
+    matches: Vec<(f32, String, String, u64, Option<(u32, u32)>)>,
     formats: Vec<String>,
     extensions: HashMap<String, String>,
 }
@@ -853,7 +927,8 @@ async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bo
                 distance,
                 index.filenames[id].container_filename(),
                 generate_filename_hash(&index.filenames[id as usize]).clone(),
-                index.format_codes[id]
+                index.format_codes[id],
+                index.metadata[id].as_ref().map(|x| (x.width, x.height))
             ))
         })
         .collect();
@@ -949,10 +1024,7 @@ async fn main() -> Result<()> {
     pretty_env_logger::init();
 
     let config_path = std::env::args().nth(1).expect("Missing config file path");
-    let config = serde_json::from_slice(&std::fs::read(config_path)?)?;
-
-    let pool = initialize_database(&config).await?;
-    sqlx::query(SCHEMA).execute(&pool).await?;
+    let config: Config = serde_json::from_slice(&std::fs::read(config_path)?)?;
 
     let backend = get_backend_config(&config.clip_server).await;
 

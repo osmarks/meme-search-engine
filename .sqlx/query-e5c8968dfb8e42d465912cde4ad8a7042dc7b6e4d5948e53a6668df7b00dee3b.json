@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT OR REPLACE INTO files (filename, embedding_time, thumbnail_time, metadata) VALUES (?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "e5c8968dfb8e42d465912cde4ad8a7042dc7b6e4d5948e53a6668df7b00dee3b"
+}

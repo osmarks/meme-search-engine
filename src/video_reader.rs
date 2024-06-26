@@ -6,7 +6,7 @@ use ffmpeg::{codec, filter, format::{self, Pixel}, media::Type, util::frame::vid
 
 const BYTES_PER_PIXEL: usize = 3;
 
-pub fn run<P: AsRef<std::path::Path>, F: FnMut(RgbImage) -> Result<()>>(path: P, mut frame_callback: F) -> Result<()> {
+pub fn run<P: AsRef<std::path::Path>, F: FnMut(RgbImage) -> Result<()>>(path: P, mut frame_callback: F, frame_interval: f32) -> Result<()> {
     let mut ictx = format::input(&path).context("parsing video")?;
     let video = ictx.streams().best(Type::Video).context("no video stream")?;
     let video_index = video.index();
@@ -16,9 +16,17 @@ pub fn run<P: AsRef<std::path::Path>, F: FnMut(RgbImage) -> Result<()>>(path: P,
 
     let mut graph = filter::Graph::new();
     let afr = video.avg_frame_rate();
-    let afr = (((afr.0 as f32) / (afr.1 as f32)).round() as i64).max(1);
+    let afr = ((frame_interval * (afr.0 as f32) / (afr.1 as f32)).round() as i64).max(1);
+
+    // I don't actually know what this does, but in some cases it's 0/0 so "correct" for that.
+    let aspect_ratio = decoder.aspect_ratio();
+    let mut aspect_ratio = (aspect_ratio.0, aspect_ratio.1);
+    if aspect_ratio == (0, 0) {
+        aspect_ratio = (1, 1);
+    }
+
     graph.add(&filter::find("buffer").unwrap(), "in", 
-        &format!("video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}", decoder.width(), decoder.height(), decoder.format().descriptor().unwrap().name(), video.time_base().0, video.time_base().1, decoder.aspect_ratio().0, decoder.aspect_ratio().1))?;
+        &format!("video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}", decoder.width(), decoder.height(), decoder.format().descriptor().unwrap().name(), video.time_base().0, video.time_base().1, aspect_ratio.0, aspect_ratio.1))?;
     graph.add(&filter::find("buffersink").unwrap(), "out", "")?;
     // I don't know exactly where, but some of my videos apparently have the size vary throughout them.
     // This causes horrible segfaults somewhere.
@@ -75,5 +83,5 @@ fn main() -> Result<()> {
         count += 1;
         Ok(())
     };
-    run(&env::args().nth(1).unwrap(), callback)
+    run(&env::args().nth(1).unwrap(), callback, 1.0)
 }
