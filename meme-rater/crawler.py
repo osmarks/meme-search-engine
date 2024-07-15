@@ -9,6 +9,10 @@ import sys
 
 async def fetch_list_seg(sess, list_url, query):
     async with sess.get(list_url + ".json", params=query) as res:
+        if rate_limit := res.headers.get("x-ratelimit-remaining"):
+            rl = float(rate_limit)
+            if rl <= 5.0:
+                await asyncio.sleep(float(res.headers["x-ratelimit-reset"]))
         return await res.json()
 
 async def fetch_past(sess, list_url, n):
