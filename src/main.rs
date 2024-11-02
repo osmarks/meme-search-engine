@@ -33,6 +33,7 @@ use faiss::index::scalar_quantizer;
 use lazy_static::lazy_static;
 use prometheus::{register_int_counter, register_int_counter_vec, register_int_gauge, Encoder, IntCounter, IntGauge, IntCounterVec};
 use ndarray::ArrayBase;
+use tracing::instrument;
 
 mod ocr;
 mod common;
@@ -249,7 +250,7 @@ async fn initialize_database(config: &Config) -> Result<SqlitePool> {
         if (index as i32) < version {
             continue
         }
-        log::info!("Migrating to DB version {}", index);
+        tracing::info!("Migrating to DB version {}", index);
         sqlx::query(sql).execute(&mut *tx).await?;
         sqlx::query(&format!("PRAGMA user_version = {}", index + 1)).execute(&mut *tx).await?;
     }
@@ -317,6 +318,7 @@ fn image_formats(_config: &Config) -> HashMap<String, ImageFormatConfig> {
     formats
 }
 
+#[instrument(skip_all)]
 async fn ensure_filename_record_exists(conn: &mut SqliteConnection, filename_enc: &Vec<u8>) -> Result<()> {
     sqlx::query!("INSERT OR IGNORE INTO files (filename) VALUES (?)", filename_enc)
         .execute(conn)
@@ -324,6 +326,7 @@ async fn ensure_filename_record_exists(conn: &mut SqliteConnection, filename_enc
     Ok(())
 }
 
+#[instrument(skip_all)]
 async fn write_metadata(conn: &mut SqliteConnection, filename_enc: &Vec<u8>, metadata: FileMetadata) -> Result<()> {
     ensure_filename_record_exists(conn, filename_enc).await?;
     let metadata_serialized = rmp_serde::to_vec_named(&metadata)?;
@@ -333,18 +336,276 @@ async fn write_metadata(conn: &mut SqliteConnection, filename_enc: &Vec<u8>, met
     Ok(())
 }
 
+#[instrument]
+async fn handle_embedding_batch(client: reqwest::Client, config: Arc<WConfig>, pool: SqlitePool, batch: Vec<EmbeddingInput>, video_embed_times: Arc<RwLock<HashMap<CompactString, i64>>>) -> Result<()> {
+    let result: Vec<serde_bytes::ByteBuf> = query_clip_server(
+        &client,
+        &config.service.clip_server,
+        "",
+        EmbeddingRequest::Images {
+            images: batch.iter().map(|input| serde_bytes::ByteBuf::from(input.image.clone())).collect(),
+        },
+    ).await.context("querying CLIP server")?;
+
+    let mut tx = pool.begin().await?;
+    let ts = timestamp();
+    for (i, vector) in result.into_iter().enumerate() {
+        let vector = vector.into_vec();
+        tracing::debug!("embedded {:?}", batch[i].filename);
+        let encoded_filename = batch[i].filename.encode()?;
+        IMAGES_EMBEDDED_COUNTER.inc();
+        ensure_filename_record_exists(&mut *tx, &encoded_filename).await?;
+        match &batch[i].filename {
+            Filename::VideoFrame(container, _) => { video_embed_times.write().await.insert(container.clone(), timestamp()); },
+            _ => ()
+        }
+        sqlx::query!(
+            "UPDATE files SET embedding_time = ?, embedding = ? WHERE filename = ?",
+            ts,
+            vector,
+            encoded_filename
+        )
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    anyhow::Result::Ok(())
+}
+
+#[instrument(skip(to_embed_tx, to_thumbnail_tx, to_ocr_tx, to_metadata_write_tx, video_meta))]
+async fn load_image(record: FileRecord, to_embed_tx: mpsc::Sender<EmbeddingInput>, to_thumbnail_tx: mpsc::Sender<LoadedImage>, to_ocr_tx: mpsc::Sender<LoadedImage>, to_metadata_write_tx: mpsc::Sender<(Filename, FileMetadata)>, config: Arc<WConfig>, video_meta: Arc<RwLock<HashMap<CompactString, FileMetadata>>>) -> Result<()> {
+    let path = Path::new(&config.service.files).join(&*record.filename);
+    let image: Result<Arc<DynamicImage>> = tokio::task::block_in_place(|| Ok(Arc::new(ImageReader::open(&path)?.with_guessed_format()?.decode()?)));
+    let image = match image {
+        Ok(image) => image,
+        Err(e) => {
+            tracing::warn!("Could not read {} as image: {}", record.filename, e);
+            let filename = record.filename.clone();
+            IMAGES_LOADED_ERROR_COUNTER.inc();
+            let meta = tokio::task::spawn_blocking(move || -> Result<Option<FileMetadata>> {
+                let mut i: u32 = 0;
+                let mut last_metadata = None;
+                let callback = |frame: RgbImage| {
+                    let frame: Arc<DynamicImage> = Arc::new(frame.into());
+                    let embed_buf = resize_for_embed_sync(config.backend.clone(), frame.clone())?;
+                    let filename = Filename::VideoFrame(filename.clone(), i);
+                    to_embed_tx.blocking_send(EmbeddingInput {
+                        image: embed_buf,
+                        filename: filename.clone()
+                    })?;
+                    let meta = FileMetadata {
+                        height: frame.height(),
+                        width: frame.width(),
+                        frames: Some(i + 1)
+                    };
+                    last_metadata = Some(meta.clone());
+                    to_metadata_write_tx.blocking_send((filename.clone(), meta))?;
+                    if config.service.enable_thumbs {
+                        to_thumbnail_tx.blocking_send(LoadedImage {
+                            image: frame.clone(),
+                            filename,
+                            original_filesize: None,
+                            fast_thumbnails_only: true
+                        })?;
+                    }
+                    i += 1;
+                    Ok(())
+                };
+                match video_reader::run(&path, callback, config.service.video_frame_interval) {
+                    Ok(()) => {
+                        VIDEOS_LOADED_COUNTER.inc();
+                        return anyhow::Result::Ok(last_metadata)
+                    },
+                    Err(e) => {
+                        tracing::error!("Could not read {} as video: {}", filename, e);
+                        VIDEOS_LOADED_ERROR_COUNTER.inc();
+                    }
+                }
+                return anyhow::Result::Ok(last_metadata)
+            }).await??;
+            if let Some(meta) = meta {
+                video_meta.write().await.insert(record.filename, meta);
+            }
+            return Ok(())
+        }
+    };
+    let filename = Filename::Actual(record.filename);
+    if record.needs_metadata {
+        let metadata = FileMetadata {
+            width: image.width(),
+            height: image.height(),
+            frames: None
+        };
+        to_metadata_write_tx.send((filename.clone(), metadata)).await?;
+    }
+    IMAGES_LOADED_COUNTER.inc();
+    if record.needs_embed {
+        let resized = resize_for_embed(config.backend.clone(), image.clone()).await?;
+
+        to_embed_tx.send(EmbeddingInput { image: resized, filename: filename.clone() }).await?
+    }
+    if record.needs_thumbnail {
+        to_thumbnail_tx
+            .send(LoadedImage {
+                image: image.clone(),
+                filename: filename.clone(),
+                original_filesize: Some(std::fs::metadata(&path)?.len() as usize),
+                fast_thumbnails_only: false
+            })
+            .await?;
+    }
+    if record.needs_ocr {
+        to_ocr_tx
+            .send(LoadedImage {
+                image,
+                filename: filename.clone(),
+                original_filesize: None,
+                fast_thumbnails_only: true
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+#[instrument(skip(video_thumb_times, pool, formats))]
+async fn generate_thumbnail(image: LoadedImage, config: Arc<WConfig>, video_thumb_times: Arc<RwLock<HashMap<CompactString, i64>>>, pool: SqlitePool, formats: Arc<HashMap<String, ImageFormatConfig>>) -> Result<()> {
+    use image::codecs::*;
+
+    let filename = image.filename.clone();
+    tracing::debug!("thumbnailing {:?}", filename);
+
+    let generated_formats = tokio::task::spawn_blocking(move || {
+        let mut generated_formats = Vec::new();
+        let rgb = DynamicImage::from(image.image.to_rgb8());
+        for (format_name, format_config) in &*formats {
+            if !format_config.is_fast && image.fast_thumbnails_only { continue }
+            let resized = if format_config.target_filesize != 0 {
+                let mut lb = 1;
+                let mut ub = 100;
+                loop {
+                    let quality = (lb + ub) / 2;
+                    let thumbnail = rgb.resize(
+                        format_config.target_width.min(rgb.width()),
+                        u32::MAX,
+                        FilterType::Lanczos3,
+                    );
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut csr = Cursor::new(&mut buf);
+                    // this is ugly but I don't actually know how to fix it (cannot factor it out due to issues with dyn Trait)
+                    match format_config.format {
+                        ImageFormat::Avif => thumbnail.write_with_encoder(avif::AvifEncoder::new_with_speed_quality(&mut csr, 4, quality)),
+                        ImageFormat::Jpeg => thumbnail.write_with_encoder(jpeg::JpegEncoder::new_with_quality(&mut csr, quality)),
+                        _ => unimplemented!()
+                    }?;
+                    if buf.len() > format_config.target_filesize {
+                        ub = quality;
+                    } else {
+                        lb = quality + 1;
+                    }
+                    if lb >= ub {
+                        break buf;
+                    }
+                }
+            } else {
+                let thumbnail = rgb.resize(
+                    format_config.target_width.min(rgb.width()),
+                    u32::MAX,
+                    FilterType::Lanczos3,
+                );
+                let mut buf: Vec<u8> = Vec::new();
+                let mut csr = Cursor::new(&mut buf);
+                match format_config.format {
+                    ImageFormat::Avif => thumbnail.write_with_encoder(avif::AvifEncoder::new_with_speed_quality(&mut csr, 4, format_config.quality)),
+                    ImageFormat::Jpeg => thumbnail.write_with_encoder(jpeg::JpegEncoder::new_with_quality(&mut csr, format_config.quality)),
+                    ImageFormat::WebP => thumbnail.write_with_encoder(webp::WebPEncoder::new_lossless(&mut csr)),
+                    _ => unimplemented!()
+                }?;
+                buf
+            };
+            if resized.len() < image.original_filesize.unwrap_or(usize::MAX) {
+                generated_formats.push(format_name.clone());
+                let thumbnail_path = Path::new(&config.service.thumbs_path).join(
+                    generate_thumbnail_filename(
+                        &image.filename,
+                        format_name,
+                        format_config,
+                    ),
+                );
+                THUMBNAILS_GENERATED_COUNTER.get_metric_with_label_values(&[format_name]).unwrap().inc();
+                std::fs::write(thumbnail_path, resized)?;
+            }
+        }
+        Ok::<Vec<String>, anyhow::Error>(generated_formats)
+    }).await??;
+
+    IMAGES_THUMBNAILED_COUNTER.inc();
+    let formats_data = rmp_serde::to_vec(&generated_formats)?;
+    let ts = timestamp();
+    let filename_enc = filename.encode()?;
+    let mut conn = pool.acquire().await?;
+    ensure_filename_record_exists(&mut conn, &filename_enc).await?;
+    match filename {
+        Filename::VideoFrame(container, _) => { video_thumb_times.write().await.insert(container.clone(), timestamp()); },
+        _ => ()
+    }
+    sqlx::query!(
+        "UPDATE files SET thumbnails = ?, thumbnail_time = ? WHERE filename = ?",
+        formats_data,
+        ts,
+        filename_enc
+    )
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+#[instrument]
+async fn do_ocr(image: LoadedImage, config: Arc<WConfig>, client: Client, pool: SqlitePool) -> Result<()> {
+    tracing::debug!("OCRing {:?}", image.filename);
+    let scan = match scan_image(&client, &image.image).await {
+        Ok(scan) => scan,
+        Err(e) => {
+            IMAGES_OCRED_ERROR_COUNTER.inc();
+            tracing::error!("OCR failure {:?}: {}", image.filename, e);
+            return Ok(())
+        }
+    };
+    IMAGES_OCRED_COUNTER.inc();
+    let ocr_text = scan
+        .iter()
+        .map(|segment| segment.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ocr_data = rmp_serde::to_vec(&scan)?;
+    let ts = timestamp();
+    let filename_enc = image.filename.encode()?;
+    let mut conn = pool.acquire().await?;
+    ensure_filename_record_exists(&mut conn, &filename_enc).await?;
+    sqlx::query!(
+        "UPDATE files SET ocr = ?, raw_ocr_segments = ?, ocr_time = ? WHERE filename = ?",
+        ocr_text,
+        ocr_data,
+        ts,
+        filename_enc
+    )
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
+}
+
+#[instrument]
 async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
     let pool = initialize_database(&config.service).await?;
     let client = Client::new();
-    
+
     let formats = image_formats(&config.service);
-    
+
     let (to_process_tx, to_process_rx) = mpsc::channel::<FileRecord>(100);
     let (to_embed_tx, to_embed_rx) = mpsc::channel(config.backend.batch as usize);
     let (to_thumbnail_tx, to_thumbnail_rx) = mpsc::channel(30);
     let (to_ocr_tx, to_ocr_rx) = mpsc::channel(30);
     let (to_metadata_write_tx, mut to_metadata_write_rx) = mpsc::channel::<(Filename, FileMetadata)>(100);
-    
+
     let cpus = num_cpus::get();
 
     let video_meta = Arc::new(RwLock::new(HashMap::new()));
@@ -363,102 +624,10 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
             let to_ocr_tx = to_ocr_tx.clone();
             let video_meta = video_meta.clone();
             let to_metadata_write_tx = to_metadata_write_tx.clone();
-            async move {
-                let path = Path::new(&config.service.files).join(&*record.filename);
-                let image: Result<Arc<DynamicImage>> = tokio::task::block_in_place(|| Ok(Arc::new(ImageReader::open(&path)?.with_guessed_format()?.decode()?)));
-                let image = match image {
-                    Ok(image) => image,
-                    Err(e) => {
-                        log::warn!("Could not read {} as image: {}", record.filename, e);
-                        let filename = record.filename.clone();
-                        IMAGES_LOADED_ERROR_COUNTER.inc();
-                        let meta = tokio::task::spawn_blocking(move || -> Result<Option<FileMetadata>> {
-                            let mut i: u32 = 0;
-                            let mut last_metadata = None;
-                            let callback = |frame: RgbImage| {
-                                let frame: Arc<DynamicImage> = Arc::new(frame.into());
-                                let embed_buf = resize_for_embed_sync(config.backend.clone(), frame.clone())?;
-                                let filename = Filename::VideoFrame(filename.clone(), i);
-                                to_embed_tx.blocking_send(EmbeddingInput {
-                                    image: embed_buf,
-                                    filename: filename.clone()
-                                })?;
-                                let meta = FileMetadata {
-                                    height: frame.height(),
-                                    width: frame.width(),
-                                    frames: Some(i + 1)
-                                };
-                                last_metadata = Some(meta.clone());
-                                to_metadata_write_tx.blocking_send((filename.clone(), meta))?;
-                                if config.service.enable_thumbs {
-                                    to_thumbnail_tx.blocking_send(LoadedImage {
-                                        image: frame.clone(),
-                                        filename,
-                                        original_filesize: None,
-                                        fast_thumbnails_only: true
-                                    })?;
-                                }
-                                i += 1;
-                                Ok(())
-                            };
-                            match video_reader::run(&path, callback, config.service.video_frame_interval) {
-                                Ok(()) => {
-                                    VIDEOS_LOADED_COUNTER.inc();
-                                    return anyhow::Result::Ok(last_metadata)
-                                },
-                                Err(e) => {
-                                    log::error!("Could not read {} as video: {}", filename, e);
-                                    VIDEOS_LOADED_ERROR_COUNTER.inc();
-                                }
-                            }
-                            return anyhow::Result::Ok(last_metadata)
-                        }).await??;
-                        if let Some(meta) = meta {
-                            video_meta.write().await.insert(record.filename, meta);
-                        }
-                        return Ok(())
-                    }
-                };
-                let filename = Filename::Actual(record.filename);
-                if record.needs_metadata {
-                    let metadata = FileMetadata {
-                        width: image.width(),
-                        height: image.height(),
-                        frames: None
-                    };
-                    to_metadata_write_tx.send((filename.clone(), metadata)).await?;
-                }
-                IMAGES_LOADED_COUNTER.inc();
-                if record.needs_embed {
-                    let resized = resize_for_embed(config.backend.clone(), image.clone()).await?;
-                    
-                    to_embed_tx.send(EmbeddingInput { image: resized, filename: filename.clone() }).await?
-                }
-                if record.needs_thumbnail {
-                    to_thumbnail_tx
-                        .send(LoadedImage {
-                            image: image.clone(),
-                            filename: filename.clone(),
-                            original_filesize: Some(std::fs::metadata(&path)?.len() as usize),
-                            fast_thumbnails_only: false
-                        })
-                        .await?;
-                }
-                if record.needs_ocr {
-                    to_ocr_tx
-                        .send(LoadedImage {
-                            image,
-                            filename: filename.clone(),
-                            original_filesize: None,
-                            fast_thumbnails_only: true
-                        })
-                        .await?;
-                }
-                Ok(())
-            }
+            load_image(record, to_embed_tx, to_thumbnail_tx, to_ocr_tx, to_metadata_write_tx, config, video_meta)
         })
     });
-    
+
     let metadata_writer: JoinHandle<Result<()>> = tokio::spawn({
         let pool = pool.clone();
         async move {
@@ -468,7 +637,7 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
             Ok(())
         }
     });
-    
+
     let thumbnail_generation: Option<JoinHandle<Result<()>>> = if config.service.enable_thumbs {
         let config = config.clone();
         let pool = pool.clone();
@@ -477,145 +646,29 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
         let video_thumb_times = video_thumb_times.clone();
         Some(tokio::spawn({
             stream.try_for_each_concurrent(Some(cpus), move |image| {
-                use image::codecs::*;
-
                 let formats = formats.clone();
                 let config = config.clone();
                 let pool = pool.clone();
                 let video_thumb_times = video_thumb_times.clone();
-                async move {
-                    let filename = image.filename.clone();
-                    log::debug!("thumbnailing {:?}", filename);
-                    let generated_formats = tokio::task::spawn_blocking(move || {
-                        let mut generated_formats = Vec::new();
-                        let rgb = DynamicImage::from(image.image.to_rgb8());
-                        for (format_name, format_config) in &*formats {
-                            if !format_config.is_fast && image.fast_thumbnails_only { continue }
-                            let resized = if format_config.target_filesize != 0 {
-                                let mut lb = 1;
-                                let mut ub = 100;
-                                loop {
-                                    let quality = (lb + ub) / 2;
-                                    let thumbnail = rgb.resize(
-                                        format_config.target_width.min(rgb.width()),
-                                        u32::MAX,
-                                        FilterType::Lanczos3,
-                                    );
-                                    let mut buf: Vec<u8> = Vec::new();
-                                    let mut csr = Cursor::new(&mut buf);
-                                    // this is ugly but I don't actually know how to fix it (cannot factor it out due to issues with dyn Trait)
-                                    match format_config.format {
-                                        ImageFormat::Avif => thumbnail.write_with_encoder(avif::AvifEncoder::new_with_speed_quality(&mut csr, 4, quality)),
-                                        ImageFormat::Jpeg => thumbnail.write_with_encoder(jpeg::JpegEncoder::new_with_quality(&mut csr, quality)),
-                                        _ => unimplemented!()
-                                    }?;
-                                    if buf.len() > format_config.target_filesize {
-                                        ub = quality;
-                                    } else {
-                                        lb = quality + 1;
-                                    }
-                                    if lb >= ub {
-                                        break buf;
-                                    }
-                                }
-                            } else {
-                                let thumbnail = rgb.resize(
-                                    format_config.target_width.min(rgb.width()),
-                                    u32::MAX,
-                                    FilterType::Lanczos3,
-                                );
-                                let mut buf: Vec<u8> = Vec::new();
-                                let mut csr = Cursor::new(&mut buf);
-                                match format_config.format {
-                                    ImageFormat::Avif => thumbnail.write_with_encoder(avif::AvifEncoder::new_with_speed_quality(&mut csr, 4, format_config.quality)),
-                                    ImageFormat::Jpeg => thumbnail.write_with_encoder(jpeg::JpegEncoder::new_with_quality(&mut csr, format_config.quality)),
-                                    ImageFormat::WebP => thumbnail.write_with_encoder(webp::WebPEncoder::new_lossless(&mut csr)),
-                                    _ => unimplemented!()
-                                }?;
-                                buf
-                            };
-                            if resized.len() < image.original_filesize.unwrap_or(usize::MAX) {
-                                generated_formats.push(format_name.clone());
-                                let thumbnail_path = Path::new(&config.service.thumbs_path).join(
-                                    generate_thumbnail_filename(
-                                        &image.filename,
-                                        format_name,
-                                        format_config,
-                                    ),
-                                );
-                                THUMBNAILS_GENERATED_COUNTER.get_metric_with_label_values(&[format_name]).unwrap().inc();
-                                std::fs::write(thumbnail_path, resized)?;
-                            }
-                        }
-                        Ok::<Vec<String>, anyhow::Error>(generated_formats)
-                    }).await??;
-                    IMAGES_THUMBNAILED_COUNTER.inc();
-                    let formats_data = rmp_serde::to_vec(&generated_formats)?;
-                    let ts = timestamp();
-                    let filename_enc = filename.encode()?;
-                    let mut conn = pool.acquire().await?;
-                    ensure_filename_record_exists(&mut conn, &filename_enc).await?;
-                    match filename {
-                        Filename::VideoFrame(container, _) => { video_thumb_times.write().await.insert(container.clone(), timestamp()); },
-                        _ => ()
-                    }
-                    sqlx::query!(
-                        "UPDATE files SET thumbnails = ?, thumbnail_time = ? WHERE filename = ?",
-                        formats_data,
-                        ts,
-                        filename_enc
-                    )
-                        .execute(&mut *conn)
-                        .await?;
-                    Ok(())
-                }
+                generate_thumbnail(image, config, video_thumb_times, pool, formats)
             })
         }))
     } else {
         None
     };
-    
+
     // TODO: save OCR errors and don't retry
     let ocr: Option<JoinHandle<Result<()>>> = if config.service.enable_ocr {
         let client = client.clone();
         let pool = pool.clone();
+        let config = config.clone();
         let stream = ReceiverStream::new(to_ocr_rx).map(Ok);
         Some(tokio::spawn({
             stream.try_for_each_concurrent(Some(config.service.ocr_concurrency), move |image| {
                 let client = client.clone();
                 let pool = pool.clone();
-                async move {
-                    log::debug!("OCRing {:?}", image.filename);
-                    let scan = match scan_image(&client, &image.image).await {
-                        Ok(scan) => scan,
-                        Err(e) => {
-                            IMAGES_OCRED_ERROR_COUNTER.inc();
-                            log::error!("OCR failure {:?}: {}", image.filename, e);
-                            return Ok(())
-                        }
-                    };
-                    IMAGES_OCRED_COUNTER.inc();
-                    let ocr_text = scan
-                        .iter()
-                        .map(|segment| segment.text.clone())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    let ocr_data = rmp_serde::to_vec(&scan)?;
-                    let ts = timestamp();
-                    let filename_enc = image.filename.encode()?;
-                    let mut conn = pool.acquire().await?;
-                    ensure_filename_record_exists(&mut conn, &filename_enc).await?;
-                    sqlx::query!(
-                        "UPDATE files SET ocr = ?, raw_ocr_segments = ?, ocr_time = ? WHERE filename = ?",
-                        ocr_text,
-                        ocr_data,
-                        ts,
-                        filename_enc
-                    )
-                        .execute(&mut *conn)
-                        .await?;
-                    Ok(())
-                }
+                let config = config.clone();
+                do_ocr(image, config, client, pool)
             })
         }))
     } else {
@@ -634,45 +687,12 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
             let config = config.clone();
             let pool = pool.clone();
             let video_embed_times = video_embed_times.clone();
-            async move {
-                let result: Vec<serde_bytes::ByteBuf> = query_clip_server(
-                    &client,
-                    &config.service.clip_server,
-                    "",
-                    EmbeddingRequest::Images {
-                        images: batch.iter().map(|input| serde_bytes::ByteBuf::from(input.image.clone())).collect(),
-                    },
-                ).await.context("querying CLIP server")?;
-                
-                let mut tx = pool.begin().await?;
-                let ts = timestamp();
-                for (i, vector) in result.into_iter().enumerate() {
-                    let vector = vector.into_vec();
-                    log::debug!("embedded {:?}", batch[i].filename);
-                    let encoded_filename = batch[i].filename.encode()?;
-                    IMAGES_EMBEDDED_COUNTER.inc();
-                    ensure_filename_record_exists(&mut *tx, &encoded_filename).await?;
-                    match &batch[i].filename {
-                        Filename::VideoFrame(container, _) => { video_embed_times.write().await.insert(container.clone(), timestamp()); },
-                        _ => ()
-                    }
-                    sqlx::query!(
-                        "UPDATE files SET embedding_time = ?, embedding = ? WHERE filename = ?",
-                        ts,
-                        vector,
-                        encoded_filename
-                    )
-                        .execute(&mut *tx)
-                        .await?;
-                }
-                tx.commit().await?;
-                anyhow::Result::Ok(())
-            }
+            handle_embedding_batch(client, config, pool, batch, video_embed_times)
         })
     });
-                
+
     let mut actual_filenames = HashMap::new();
-    
+
     // blocking OS calls
     tokio::task::block_in_place(|| -> anyhow::Result<()> {
         for entry in WalkDir::new(config.service.files.as_str()) {
@@ -688,7 +708,7 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
         Ok(())
     })?;
 
-    log::debug!("finished reading filenames");
+    tracing::debug!("finished reading filenames");
 
     for (filename, (_path, modtime)) in actual_filenames.iter() {
         let modtime = *modtime;
@@ -721,7 +741,7 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
             }
         };
         if let Some(record) = new_record {
-            log::debug!("processing {}", record.filename);
+            tracing::debug!("processing {}", record.filename);
             // we need to exit here to actually capture the error
             if !to_process_tx.send(record).await.is_ok() {
                 break
@@ -730,20 +750,20 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
     }
 
     drop(to_process_tx);
-    
+
     embedding_generation.await?.context("generating embeddings")?;
     metadata_writer.await?.context("writing metadata")?;
-    
+
     if let Some(thumbnail_generation) = thumbnail_generation {
         thumbnail_generation.await?.context("generating thumbnails")?;
     }
-    
+
     if let Some(ocr) = ocr {
         ocr.await?.context("OCRing")?;
     }
 
     image_loading.await?.context("loading images")?;
-    
+
     let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT filename FROM files").fetch_all(&pool).await?;
     let mut tx = pool.begin().await?;
     let video_meta = video_meta.read().await;
@@ -785,13 +805,14 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
 
     tx.commit().await?;
 
-    log::info!("Ingest done");
-    
+    tracing::info!("Ingest done");
+
     Result::Ok(())
 }
 
 const INDEX_ADD_BATCH: usize = 512;
 
+#[instrument]
 async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
     let pool = initialize_database(&config.service).await?;
 
@@ -846,7 +867,7 @@ async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
             } else {
                 index.metadata.push(None);
             }
-            
+
             for format_string in &formats {
                 let mut found = false;
                 for (i, name) in index.format_names.iter().enumerate() {
@@ -904,6 +925,7 @@ struct QueryRequest {
     include_video: bool
 }
 
+#[instrument(skip(index))]
 async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bool) -> Result<QueryResult> {
     let result = index.vectors.search(&query, k as usize)?;
 
@@ -940,6 +962,7 @@ async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bo
     })
 }
 
+#[instrument(skip(config, client, index))]
 async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IIndex, req: Json<QueryRequest>) -> Result<Response<Body>> {
     let mut total_embedding = ndarray::Array::from(vec![0.0; config.backend.embedding_size]);
 
@@ -973,8 +996,8 @@ async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IInde
             total_embedding = total_embedding + embedding * term.weight.unwrap_or(1.0);
         }
     }
-    
-    let mut batches = vec![];    
+
+    let mut batches = vec![];
 
     if !image_batch.is_empty() {
         batches.push(
@@ -1016,12 +1039,13 @@ async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IInde
 #[derive(Serialize, Deserialize)]
 struct FrontendInit {
     n_total: u64,
-    predefined_embedding_names: Vec<String>
+    predefined_embedding_names: Vec<String>,
+    d_emb: usize
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    pretty_env_logger::init();
+    console_subscriber::init();
 
     let config_path = std::env::args().nth(1).expect("Missing config file path");
     let config: Config = serde_json::from_slice(&std::fs::read(config_path)?)?;
@@ -1062,23 +1086,23 @@ async fn main() -> Result<()> {
         let index = index.clone();
         async move {
             loop {
-                log::info!("Ingest running");
+                tracing::info!("Ingest running");
                 match ingest_files(config.clone()).await {
                     Ok(_) => {
                         match build_index(config.clone()).await {
                             Ok(new_index) => {
                                 LAST_INDEX_SIZE.set(new_index.vectors.ntotal() as i64);
                                 *index.write().await = new_index;
-                                log::info!("Index loaded");
+                                tracing::info!("Index loaded");
                             }
                             Err(e) => {
-                                log::error!("Index build failed: {:?}", e);
+                                tracing::error!("Index build failed: {:?}", e);
                                 ingest_done_tx.send((false, format!("{:?}", e))).unwrap();
                             }
                         }
                     }
                     Err(e) => {
-                        log::error!("Ingest failed: {:?}", e);
+                        tracing::error!("Ingest failed: {:?}", e);
                         ingest_done_tx.send((false, format!("{:?}", e))).unwrap();
                     }
                 }
@@ -1106,11 +1130,12 @@ async fn main() -> Result<()> {
         .route("/", get(|_req: ()| async move {
             Json(FrontendInit {
                 n_total: index_.read().await.vectors.ntotal(),
-                predefined_embedding_names: config__.predefined_embeddings.keys().cloned().collect()
+                predefined_embedding_names: config__.predefined_embeddings.keys().cloned().collect(),
+                d_emb: config__.backend.embedding_size
             })
         }))
         .route("/reload", post(|_req: ()| async move {
-            log::info!("Requesting index reload");
+            tracing::info!("Requesting index reload");
             let mut done_rx = done_tx.clone().subscribe();
             let _ = request_ingest_tx.send(()).await; // ignore possible error, which is presumably because the queue is full
             match done_rx.recv().await {
@@ -1141,9 +1166,9 @@ async fn main() -> Result<()> {
         .layer(cors);
 
     let addr = format!("0.0.0.0:{}", config_.service.port);
-    log::info!("Starting server on {}", addr);
+    tracing::info!("Starting server on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await?;
 
     Ok(())
-}            
+}

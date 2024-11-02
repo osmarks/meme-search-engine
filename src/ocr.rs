@@ -9,6 +9,7 @@ use reqwest::{
 use serde_json::Value;
 use std::{io::Cursor, time::{SystemTime, UNIX_EPOCH}};
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
 
 const CALLBACK_REGEX: &str = r">AF_initDataCallback\((\{key: 'ds:1'.*?\})\);</script>";
 const MAX_DIM: u32 = 1024;
@@ -45,6 +46,7 @@ fn rationalize_coords_format1(
     }
 }
 
+#[instrument(skip(client, image))]
 async fn scan_image_chunk(
     client: &Client,
     image: &[u8],
@@ -130,13 +132,14 @@ async fn scan_image_chunk(
         .collect())
 }
 
+#[instrument(skip(client))]
 pub async fn scan_image(client: &Client, image: &DynamicImage) -> Result<ScanResult> {
     let mut result = ScanResult::new();
     let (width, height) = image.dimensions();
 
     let (width, height, image) = if width > MAX_DIM {
         let height = ((height as f64) * (MAX_DIM as f64) / (width as f64)).round() as u32;
-        let new_image = tokio::task::block_in_place(|| image.resize_exact(MAX_DIM, height, image::imageops::FilterType::Lanczos3));
+        let new_image = tokio::task::block_in_place(|| image.resize_exact(MAX_DIM, height, image::imageops::FilterType::CatmullRom));
         (MAX_DIM, height, std::borrow::Cow::Owned(new_image))
     } else {
         (width, height, std::borrow::Cow::Borrowed(image))

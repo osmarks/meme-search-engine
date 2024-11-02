@@ -6,14 +6,13 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "tracing"] }
 axum = "0.7"
 image = { version = "0.25", features = ["avif", "avif-native", "nasm"] }
 reqwest = { version = "0.12", features = ["multipart"] }
 serde = { version = "1", features = ["derive"] }
 sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
 walkdir = "1"
-log = "0.4"
 rmp-serde = "1"
 serde_json = "1"
 chrono = "0.4"
@@ -24,7 +23,8 @@ faiss = "0.12"
 ndarray = "0.15"
 half = { version = "2" }
 regex = "1"
-pretty_env_logger = "0.5"
+tracing = "0.1"
+console-subscriber = "0.4"
 futures-util = "0.3"
 tokio-stream = "0.1"
 num_cpus = "1"
@@ -41,9 +41,8 @@ mimalloc = "0.1"
 sonic-rs = "0.3"
 ffmpeg-the-third = "2.0"
 compact_str = { version = "0.8.0-beta", features = ["serde"] }
-
-[patch.crates-io]
-image = { git = "https://github.com/fintelia/image/", branch = "upgrade-zune-jpeg" }
+itertools = "0.13"
+async-recursion = "1"
 
 [[bin]]
 name = "reddit-dump"
@@ -52,3 +51,7 @@ path = "src/reddit_dump.rs"
 [[bin]]
 name = "video-reader"
 path = "src/video_reader.rs"
+
+[[bin]]
+name = "dump-processor"
+path = "src/dump_processor.rs"

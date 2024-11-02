@@ -4,6 +4,7 @@ use image::{DynamicImage, imageops::FilterType, ImageFormat};
 use anyhow::Result;
 use std::io::Cursor;
 use reqwest::Client;
+use tracing::instrument;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct InferenceServerConfig {
@@ -13,11 +14,13 @@ pub struct InferenceServerConfig {
 }
 
 pub fn resize_for_embed_sync<T: Borrow<DynamicImage> + Send + 'static>(config: InferenceServerConfig, image: T) -> Result<Vec<u8>> {
-    let new = image.borrow().resize(
+    // the model currently in use wants aspect ratio 1:1 regardless of input
+    // I think this was previously being handled in the CLIP server but that is slightly lossy
+    let new = image.borrow().resize_exact(
         config.image_size.0,
         config.image_size.1,
-        FilterType::Lanczos3
-    );
+        FilterType::CatmullRom
+    ).into_rgb8();
     let mut buf = Vec::new();
     let mut csr = Cursor::new(&mut buf);
     new.write_to(&mut csr, ImageFormat::Png)?;
@@ -46,13 +49,14 @@ pub async fn get_backend_config(clip_server: &str) -> InferenceServerConfig {
         match fetch_backend_config(&clip_server).await {
             Ok(backend) => break backend,
             Err(e) => {
-                log::error!("Backend failed (fetch): {}", e);
+                tracing::error!("Backend failed (fetch): {}", e);
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
     }
 }
 
+#[instrument(skip(client, data))]
 pub async fn query_clip_server<I, O>(client: &Client, base_url: &str, path: &str, data: I) -> Result<O> where I: Serialize, O: serde::de::DeserializeOwned,
 {
     let response = client
