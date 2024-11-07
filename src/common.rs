@@ -1,10 +1,19 @@
+use image::codecs::bmp::BmpEncoder;
 use serde::{Serialize, Deserialize};
 use std::borrow::Borrow;
-use image::{DynamicImage, imageops::FilterType, ImageFormat};
+use std::cell::RefCell;
+use image::{DynamicImage, ExtendedColorType, ImageEncoder};
 use anyhow::Result;
 use std::io::Cursor;
 use reqwest::Client;
 use tracing::instrument;
+use fast_image_resize::Resizer;
+use fast_image_resize::images::Image;
+use anyhow::Context;
+
+std::thread_local! {
+    static RESIZER: RefCell<Resizer> = RefCell::new(Resizer::new());
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct InferenceServerConfig {
@@ -16,14 +25,18 @@ pub struct InferenceServerConfig {
 pub fn resize_for_embed_sync<T: Borrow<DynamicImage> + Send + 'static>(config: InferenceServerConfig, image: T) -> Result<Vec<u8>> {
     // the model currently in use wants aspect ratio 1:1 regardless of input
     // I think this was previously being handled in the CLIP server but that is slightly lossy
-    let new = image.borrow().resize_exact(
-        config.image_size.0,
-        config.image_size.1,
-        FilterType::CatmullRom
-    ).into_rgb8();
+
+    let src_rgb = DynamicImage::from(image.borrow().to_rgb8()); // TODO this might be significantly inefficient for RGB8->RGB8 case
+
+    let mut dst_image = Image::new(config.image_size.0, config.image_size.1, fast_image_resize::PixelType::U8x3);
+
+    RESIZER.with_borrow_mut(|resizer| {
+        resizer.resize(&src_rgb, &mut dst_image, None)
+    }).context("resize failure")?;
+
     let mut buf = Vec::new();
     let mut csr = Cursor::new(&mut buf);
-    new.write_to(&mut csr, ImageFormat::Png)?;
+    BmpEncoder::new(&mut csr).write_image(dst_image.buffer(), config.image_size.0, config.image_size.1, ExtendedColorType::Rgb8)?;
     Ok::<Vec<u8>, anyhow::Error>(buf)
 }
 

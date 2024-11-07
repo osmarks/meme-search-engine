@@ -1,8 +1,8 @@
 Pillow==10.0.1
 prometheus-client==0.17.1
-u-msgpack-python==2.8.0
 aiohttp==3.8.5
 aiohttp-cors==0.7.0
 faiss-cpu==1.7.4
 aiosqlite==0.19.0
 open-clip-torch==2.23.0
+msgpack==1.1.0

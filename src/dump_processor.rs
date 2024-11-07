@@ -3,6 +3,7 @@ use serde::{Serialize, Deserialize};
 use std::io::BufReader;
 use rmp_serde::decode::Error as DecodeError;
 use std::fs;
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 
 // TODO refactor
 #[derive(Clone, Deserialize, Serialize, Debug, PartialEq)]
@@ -40,7 +41,7 @@ fn main() -> Result<()> {
         match res {
             Ok(x) => {
                 if x.timestamp > latest_timestamp {
-                    println!("{} {} https://reddit.com/r/{}/comments/{}", x.timestamp, count, x.subreddit, x.id);
+                    println!("{} {} https://reddit.com/r/{}/comments/{} {} https://mse.osmarks.net/?e={}", x.timestamp, count, x.subreddit, x.id, x.metadata.final_url, URL_SAFE.encode(x.embedding));
                     latest_timestamp = x.timestamp;
                 }
             },

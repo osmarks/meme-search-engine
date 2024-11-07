@@ -16,7 +16,7 @@ use axum::{
 use common::resize_for_embed_sync;
 use compact_str::CompactString;
 use image::RgbImage;
-use image::{imageops::FilterType, io::Reader as ImageReader, DynamicImage, ImageFormat};
+use image::{imageops::FilterType, ImageReader, DynamicImage, ImageFormat};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;

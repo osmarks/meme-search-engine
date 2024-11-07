@@ -43,6 +43,7 @@ ffmpeg-the-third = "2.0"
 compact_str = { version = "0.8.0-beta", features = ["serde"] }
 itertools = "0.13"
 async-recursion = "1"
+fast_image_resize = { version = "5", features = ["image"] }
 
 [[bin]]
 name = "reddit-dump"

@@ -5,7 +5,7 @@ from aiohttp import web
 import aiohttp
 import asyncio
 import traceback
-import umsgpack
+import msgpack
 import collections
 import queue
 import open_clip
@@ -58,7 +58,7 @@ if CONFIG.get("aitemplate_image_models"):
                 if "patch_embed.proj.weight" not in key:
                     params[key.replace(".", "_")] = value.cuda()
                     #print(orig_key, key.replace(".", "_"))
-    
+
         params["patch_embed_proj_weight"] = conv_weights
 
         return params
@@ -151,7 +151,7 @@ routes = web.RouteTableDef()
 @routes.post("/")
 async def run_inference(request):
     loop = asyncio.get_event_loop()
-    data = umsgpack.loads(await request.read())
+    data = msgpack.loads(await request.read())
     event = asyncio.Event()
     results = None
     def callback(*argv):
@@ -167,11 +167,11 @@ async def run_inference(request):
     else:
         status = 500
         print(results[1])
-    return web.Response(body=umsgpack.dumps(body_data), status=status, content_type="application/msgpack")
+    return web.Response(body=msgpack.dumps(body_data), status=status, content_type="application/msgpack")
 
 @routes.get("/config")
 async def config(request):
-    return web.Response(body=umsgpack.dumps({
+    return web.Response(body=msgpack.dumps({
         "model": CONFIG["model"],
         "batch": BS,
         "image_size": [ t for t in preprocess.transforms if isinstance(t, transforms.Resize) ][0].size,
