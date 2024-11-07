@@ -32,6 +32,7 @@ fn main() -> Result<()> {
     let stream = zstd::stream::Decoder::new(fs::File::open(path)?)?;
     let mut stream = BufReader::new(stream);
     let mut latest_timestamp = 0;
+    let mut earliest_timestamp = u64::MAX;
     let mut count = 0;
     loop {
         let res: Result<ProcessedEntry, DecodeError> = rmp_serde::from_read(&mut stream);
@@ -41,14 +42,15 @@ fn main() -> Result<()> {
         match res {
             Ok(x) => {
                 if x.timestamp > latest_timestamp {
-                    println!("{} {} https://reddit.com/r/{}/comments/{} {} https://mse.osmarks.net/?e={}", x.timestamp, count, x.subreddit, x.id, x.metadata.final_url, URL_SAFE.encode(x.embedding));
+                    //println!("{} {} https://reddit.com/r/{}/comments/{} {} https://mse.osmarks.net/?e={}", x.timestamp, count, x.subreddit, x.id, x.metadata.final_url, URL_SAFE.encode(x.embedding));
                     latest_timestamp = x.timestamp;
                 }
+                earliest_timestamp = earliest_timestamp.min(x.timestamp);
             },
             Err(DecodeError::InvalidDataRead(x)) | Err(DecodeError::InvalidMarkerRead(x)) if x.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e).context("decode fail")
         }
     }
-    println!("{} {}", latest_timestamp, count);
+    println!("{} {} {}", earliest_timestamp, latest_timestamp, count);
     Ok(())
 }
