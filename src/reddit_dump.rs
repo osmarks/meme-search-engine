@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use common::resize_for_embed;
 use itertools::Itertools;
-use std::{collections::HashSet, ffi::OsStr, fs::{self, read_dir}, io::{BufRead, BufReader, BufWriter, Cursor}, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashSet, ffi::OsStr, fs::{self, read_dir}, io::{BufRead, BufReader, BufWriter, Cursor}, path::PathBuf, str::FromStr, sync::Arc, time::Duration, hash::Hasher};
 use serde::{Serialize, Deserialize};
 use lazy_static::lazy_static;
 use regex::{bytes, Regex, RegexSet, RegexSetBuilder};
@@ -148,6 +148,7 @@ lazy_static! {
     static ref IMAGE_FILESIZES_HISTOGRAM: HistogramVec = register_histogram_vec!("mse_scrape_image_filesizes", "filesizes of successfully fetched images", &["format"], prometheus::exponential_buckets(100.0, 1.5, 29).unwrap()).unwrap();
     static ref IMAGE_PIXELS_HISTOGRAM: HistogramVec = register_histogram_vec!("mse_scrape_image_pixels", "pixel count of successfully fetched images", &["format"], prometheus::exponential_buckets(100.0, 1.3, 53).unwrap()).unwrap();
     static ref HTML_EXTRACTS_COUNTER: IntCounter = register_int_counter!("mse_scrape_html_extracts", "html extraction operations").unwrap();
+    static ref DISCARDED_COUNTER: IntCounter = register_int_counter!("mse_scrape_discarded", "images discarded by hash").unwrap();
 }
 
 #[instrument(skip(tx))]
@@ -209,7 +210,8 @@ struct Config {
     mode: OperatingMode,
     filename_threshold: Option<String>,
     metrics_addr: String,
-    contact_info: String
+    contact_info: String,
+    discard_hashes: HashSet<u64>
 }
 
 #[instrument(skip(client, config))]
@@ -239,11 +241,18 @@ async fn fetch_file(client: reqwest::Client, config: Arc<Config>, url: &str) -> 
         _ => ()
     }
     let mut buffer = vec![];
+    let mut hash = seahash::SeaHasher::new();
     while let Some(chunk) = response.chunk().await? {
+        hash.write(&chunk);
         buffer.extend(chunk);
         if buffer.len() > config.max_content_length {
             return Err(anyhow!("response too large"));
         }
+    }
+    let hash = hash.finish();
+    if config.discard_hashes.contains(&hash) {
+        DISCARDED_COUNTER.inc();
+        return Err(anyhow!("discarded"));
     }
     if let Some(extract_rule) = html_extract_rule {
         if content_type == "text/html" {
@@ -329,7 +338,7 @@ async fn serve_metrics(config: Arc<Config>) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    console_subscriber::init();
+    tracing_subscriber::fmt::init();
 
     let cpus = num_cpus::get();
 
@@ -341,7 +350,8 @@ async fn main() -> Result<()> {
         mode: OperatingMode::FullRun,
         filename_threshold: Some(String::from("RS_2017-08.zst")),
         metrics_addr: String::from("0.0.0.0:9914"),
-        contact_info: String::from("scraping-ops@osmarks.net")
+        contact_info: String::from("scraping-ops@osmarks.net"),
+        discard_hashes: [4168519401919155623, 4577010157274124110].into_iter().collect()
     });
 
     serve_metrics(config.clone()).await?;

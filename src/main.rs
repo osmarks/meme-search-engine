@@ -40,7 +40,7 @@ mod common;
 mod video_reader;
 
 use crate::ocr::scan_image;
-use crate::common::{InferenceServerConfig, resize_for_embed, EmbeddingRequest, get_backend_config, query_clip_server};
+use crate::common::{InferenceServerConfig, resize_for_embed, EmbeddingRequest, get_backend_config, query_clip_server, decode_fp16_buffer};
 
 lazy_static! {
     static ref RELOADS_COUNTER: IntCounter = register_int_counter!("mse_reloads", "reloads executed").unwrap();
@@ -891,12 +891,6 @@ async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
     }
 
     Ok(index)
-}
-
-fn decode_fp16_buffer(buf: &[u8]) -> Vec<f32> {
-    buf.chunks_exact(2)
-        .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-        .collect()
 }
 
 type EmbeddingVector = Vec<f32>;

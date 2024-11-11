@@ -81,3 +81,9 @@ pub async fn query_clip_server<I, O>(client: &Client, base_url: &str, path: &str
     let result: O = rmp_serde::from_slice(&response.bytes().await?)?;
     Ok(result)
 }
+
+pub fn decode_fp16_buffer(buf: &[u8]) -> Vec<f32> {
+    buf.chunks_exact(2)
+        .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+        .collect()
+}
