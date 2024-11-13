@@ -7,8 +7,8 @@ use anyhow::Result;
 use std::io::Cursor;
 use reqwest::Client;
 use tracing::instrument;
-use fast_image_resize::Resizer;
-use fast_image_resize::images::Image;
+use fast_image_resize::{Resizer, ResizeOptions, ResizeAlg};
+use fast_image_resize::images::{Image, ImageRef};
 use anyhow::Context;
 
 std::thread_local! {
@@ -26,12 +26,19 @@ pub fn resize_for_embed_sync<T: Borrow<DynamicImage> + Send + 'static>(config: I
     // the model currently in use wants aspect ratio 1:1 regardless of input
     // I think this was previously being handled in the CLIP server but that is slightly lossy
 
-    let src_rgb = DynamicImage::from(image.borrow().to_rgb8()); // TODO this might be significantly inefficient for RGB8->RGB8 case
+    let src_rgb = match image.borrow() {
+        DynamicImage::ImageRgb8(x) => x,
+        x => &x.to_rgb8()
+    };
+    let (original_width, original_height) = src_rgb.dimensions();
+    let src_rgb = ImageRef::new(original_width, original_height, src_rgb.as_raw(), fast_image_resize::PixelType::U8x3)?;
 
     let mut dst_image = Image::new(config.image_size.0, config.image_size.1, fast_image_resize::PixelType::U8x3);
+    // use Hamming for downscaling, Lanczos3 for upscaling (I don't expect much upscaling)
+    let opts = ResizeOptions::default().resize_alg(ResizeAlg::Convolution(if original_width > config.image_size.0 && original_height > config.image_size.1 { fast_image_resize::FilterType::Hamming } else { fast_image_resize::FilterType::Lanczos3 }));
 
     RESIZER.with_borrow_mut(|resizer| {
-        resizer.resize(&src_rgb, &mut dst_image, None)
+        resizer.resize(&src_rgb, &mut dst_image, Some(&opts))
     }).context("resize failure")?;
 
     let mut buf = Vec::new();

@@ -348,7 +348,7 @@ async fn main() -> Result<()> {
         output: String::from("."),
         backend: String::from("http://localhost:1708"),
         mode: OperatingMode::FullRun,
-        filename_threshold: Some(String::from("RS_2017-08.zst")),
+        filename_threshold: Some(String::from("RS_2019-07.zst")),
         metrics_addr: String::from("0.0.0.0:9914"),
         contact_info: String::from("scraping-ops@osmarks.net"),
         discard_hashes: [4168519401919155623, 4577010157274124110].into_iter().collect()
