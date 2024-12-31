@@ -10,3 +10,8 @@ node_modules
 *sqlite3*
 thumbtemp
 mse-test-db-small
+clipfront2/static/bg*
+diskann/target
+*.bin
+*.msgpack
+*/flamegraph.svg

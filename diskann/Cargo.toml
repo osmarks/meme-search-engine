@@ -1,0 +1,28 @@
+[package]
+name = "diskann"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+half = { version = "2", features = ["bytemuck"] }
+fastrand = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+simsimd = "6"
+foldhash = "0.1"
+bitvec = "1"
+tqdm = "0.7"
+anyhow = "1"
+bytemuck = { version = "1", features = ["extern_crate_alloc"] }
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+rayon = "1"
+matrixmultiply = "0.3"
+
+[lib]
+name = "diskann"
+path = "src/lib.rs"
+
+[[bin]]
+name = "diskann"
+path = "src/main.rs"
