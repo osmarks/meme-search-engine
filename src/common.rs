@@ -94,3 +94,76 @@ pub fn decode_fp16_buffer(buf: &[u8]) -> Vec<f32> {
         .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
         .collect()
 }
+
+pub fn chunk_fp16_buffer(buf: &[u8]) -> Vec<half::f16> {
+    buf.chunks_exact(2)
+        .map(|chunk| half::f16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect()
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug, PartialEq)]
+pub struct OriginalImageMetadata {
+    pub mime_type: String,
+    pub original_file_size: usize,
+    pub dimension: (u32, u32),
+    pub final_url: String
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+pub struct ProcessedEntry {
+    pub url: String,
+    pub id: String,
+    pub title: String,
+    pub subreddit: String,
+    pub author: String,
+    pub timestamp: u64,
+    #[serde(with="serde_bytes")]
+    pub embedding: Vec<u8>,
+    pub metadata: OriginalImageMetadata
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+pub struct ShardInputHeader {
+    pub id: u32,
+    pub centroid: Vec<f32>,
+    pub max_query_id: usize
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+pub struct ShardedRecord {
+    pub id: u32,
+    #[serde(with="serde_bytes")]
+    pub vector: Vec<u8>, // FP16
+    pub query_knns: Vec<u32>
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+pub struct ShardHeader {
+    pub id: u32,
+    pub max: u32,
+    pub centroid: Vec<f32>,
+    pub medioid: u32,
+    pub offsets: Vec<u64>,
+    pub mapping: Vec<u32>
+}
+
+#[derive(Clone, Debug, bitcode::Encode, bitcode::Decode)]
+pub struct PackedIndexEntry {
+    pub vector: Vec<u16>, // FP16 values cast to u16 for storage
+    pub vertices: Vec<u32>,
+    pub id: u32,
+    pub timestamp: u64,
+    pub dimensions: (u32, u32),
+    pub score: f32,
+    pub url: String,
+    pub shards: Vec<u32>
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+pub struct IndexHeader {
+    pub shards: Vec<(Vec<f32>, u32)>,
+    pub count: u32,
+    pub dead_count: u32,
+    pub record_pad_size: usize,
+    pub quantizer: diskann::vector::ProductQuantizer
+}

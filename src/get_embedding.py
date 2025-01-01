@@ -15,4 +15,9 @@ output, input, *xs = sys.argv[1:]
 with open(output, "wb") as f:
     with open(input, "rb") as g:
         input_data = g.read()
-    f.write(get_embedding({"images": [input_data]})[0])
+    if not xs:
+        result = get_embedding({"images": [input_data]})[0]
+    else:
+        result = get_embedding({"text": xs})[0]
+    f.write(result)
+    print(base64.urlsafe_b64encode(result).decode("ascii"))

@@ -19,7 +19,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 mod common;
 
-use crate::common::{get_backend_config, query_clip_server, EmbeddingRequest};
+use crate::common::{get_backend_config, query_clip_server, EmbeddingRequest, OriginalImageMetadata, ProcessedEntry};
 
 fn function_which_returns_some_na() -> Option<String> { Some(String::from("na")) }
 
@@ -27,14 +27,16 @@ fn function_which_returns_some_na() -> Option<String> { Some(String::from("na"))
 #[serde(untagged)]
 enum BadTimestampFormat {
     Int(u64),
-    String(String)
+    String(String),
+    Float(f64) // *what* are they doing?
 }
 
 impl BadTimestampFormat {
     fn to_u64(&self) -> Result<u64> {
         match self {
             BadTimestampFormat::Int(x) => Ok(*x),
-            BadTimestampFormat::String(x) => u64::from_str(&x).context("invalid string")
+            BadTimestampFormat::String(x) => u64::from_str(&x).context("invalid string"),
+            BadTimestampFormat::Float(x) => Ok(*x as u64)
         }
     }
 }
@@ -53,31 +55,9 @@ struct Entry {
     id: String
 }
 
-#[derive(Clone, Deserialize, Serialize, Debug, PartialEq)]
-struct OriginalImageMetadata {
-    mime_type: String,
-    original_file_size: usize,
-    dimension: (u32, u32),
-    final_url: String
-}
-
-#[derive(Clone, Deserialize, Serialize, Debug)]
-struct ProcessedEntry {
-    url: String,
-    id: String,
-    title: String,
-    subreddit: String,
-    author: String,
-    timestamp: u64,
-    #[serde(with = "serde_bytes")]
-    embedding: Vec<u8>,
-    metadata: OriginalImageMetadata
-}
-
 lazy_static! {
-    // we do exclude galleries doing this but there don't seem to be any in the dataset
     static ref URL_IGNORE: RegexSet = RegexSet::new([
-        r"//reddit\.com",
+        r"//reddit\.com/[^g]",
         r"\.html?",
         r"\.php",
         r"\?articleid=",
@@ -85,7 +65,7 @@ lazy_static! {
         r"\.xml",
         r"/rss/",
         r"//vimeo\.com",
-        r"//www\.reddit\.com",
+        r"//www\.reddit\.com/[^g]",
         r"//v\.redd\.it",
         r"\.gifv$",
         r"youtube\.com/user/"
@@ -113,6 +93,7 @@ lazy_static! {
         "/media",
         r"youtu\.be",
         r"youtube\.com",
+        "reddit.com/gallery/"
     ]).case_insensitive(true).build().unwrap();
     static ref ACCEPTABLE_FILETYPES: HashSet<&'static str> = ["image/png", "image/webp", "image/avif", "image/jpeg", "image/gif", "image/webp", "image/apng", "image/bmp", "image/tiff"]
         .into_iter().collect();
@@ -139,6 +120,7 @@ lazy_static! {
     static ref HTML_EXTRACTION_RULES: Vec<(Regex, Regex)> = [
         (r"//imgur\.com/a/[A-Za-z0-9]+", r#"<meta name="twitter:image" data-react-helmet="true" content="([^"]+)">"#),
         (r"//imgur\.com/gallery/[A-Za-z0-9]+", r#"<meta name="twitter:image" data-react-helmet="true" content="([^"]+)">"#),
+        (r"reddit.com/gallery/[A-Za-z0-9_-]+", r#"<li style="left:0px" class="_28TEYBuEdOuE3kN6UyoKMa"><figure class="_3BxRNDoASi9FbGX01ewiLg _3o5Vzct5tn9PE7e-emdDmf"><a href="([^"]+)" rel="noopener noreferrer" target="_blank""#) // lazy Reddit gallery extraction; hopefully they don't change the HTML
     ].into_iter().map(|(r, e)| (Regex::new(r).unwrap(), Regex::new(e).unwrap())).collect();
 
     static ref IMAGES_FETCHED_COUNTER: IntCounter = register_int_counter!("mse_scrape_images_fetched", "images fetched").unwrap();
@@ -181,10 +163,7 @@ fn process_file(path: PathBuf, tx: mpsc::Sender<Entry>, timestamp_threshold: Opt
                         // Technically this is slightly wrong because we reorder images slightly, but as long as it is not restarted all the time this is "fine".
                         let after_threshold = match timestamp_threshold {
                             Some(threshold) => {
-                                let timestamp = match &entry.created_utc {
-                                    BadTimestampFormat::Int(x) => *x,
-                                    BadTimestampFormat::String(s) => u64::from_str(s).unwrap()
-                                };
+                                let timestamp = entry.created_utc.to_u64().unwrap();
                                 timestamp > threshold
                             },
                             None => true
@@ -219,7 +198,7 @@ struct Config {
 async fn fetch_file(client: reqwest::Client, config: Arc<Config>, url: &str) -> Result<(Vec<u8>, String, String)> {
     let mut url = url.to_string();
     for (regex, replacement) in URL_REPLACEMENT_RULES.iter() {
-        url = regex.replace(&url, *replacement).to_string();
+        url = regex.replace_all(&url, *replacement).to_string();
     }
 
     let mut html_extract_rule = None;
@@ -233,7 +212,7 @@ async fn fetch_file(client: reqwest::Client, config: Arc<Config>, url: &str) -> 
 
     let mut response = client.get(&*url).send().await?;
     let content_type = std::str::from_utf8(&response.headers().get(reqwest::header::CONTENT_TYPE).context("no content type")?.as_bytes())?.to_owned();
-    if !(ACCEPTABLE_FILETYPES.contains(&content_type[..]) || (html_extract_rule.is_some() && content_type == "text/html")) {
+    if !(ACCEPTABLE_FILETYPES.contains(&content_type[..]) || (html_extract_rule.is_some() && content_type.starts_with("text/html"))) {
         return Err(anyhow!("invalid Content-Type"));
     }
     match response.content_length() {
@@ -255,7 +234,7 @@ async fn fetch_file(client: reqwest::Client, config: Arc<Config>, url: &str) -> 
         return Err(anyhow!("discarded"));
     }
     if let Some(extract_rule) = html_extract_rule {
-        if content_type == "text/html" {
+        if content_type.starts_with("text/html") {
             let buffer = String::from_utf8_lossy(&buffer).to_string();
             if let Some(mat) = extract_rule.captures(&buffer) {
                 let new_url = mat.get(1).unwrap().as_str();
@@ -344,11 +323,11 @@ async fn main() -> Result<()> {
 
     let config = Arc::new(Config {
         max_content_length: 1<<24,
-        input: String::from("./reddit_subs_202212/"),
+        input: String::from("/srv/scratch/reddit_subs_202312/"),
         output: String::from("."),
         backend: String::from("http://localhost:1708"),
         mode: OperatingMode::FullRun,
-        filename_threshold: Some(String::from("RS_2019-07.zst")),
+        filename_threshold: None,
         metrics_addr: String::from("0.0.0.0:9914"),
         contact_info: String::from("scraping-ops@osmarks.net"),
         discard_hashes: [4168519401919155623, 4577010157274124110].into_iter().collect()
