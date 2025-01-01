@@ -7,7 +7,7 @@ use std::{io::Read, time::Instant};
 use anyhow::Result;
 use half::f16;
 
-use diskann::{build_graph, IndexBuildConfig, medioid, IndexGraph, greedy_search, Scratch, vector::{fast_dot, dot, VectorList, self}, Timer};
+use diskann::{build_graph, IndexBuildConfig, medioid, IndexGraph, greedy_search, Scratch, vector::{fast_dot, SCALE, dot, VectorList, self}, Timer};
 use simsimd::SpatialSimilarity;
 
 const D_EMB: usize = 1152;
@@ -40,6 +40,7 @@ fn main() -> Result<()> {
         }
         let pq_scores = codec.asymmetric_dot_product(&query, &codes);
         for (x, y) in real_scores.iter().zip(pq_scores.iter()) {
+            let y = (*y as f32) / SCALE;
             println!("{} {} {} {}", x, y, x - y, (x - y) / x);
         }
     }
