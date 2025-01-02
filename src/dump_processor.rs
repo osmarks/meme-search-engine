@@ -19,7 +19,7 @@ use diskann::vector::{scale_dot_result_f64, ProductQuantizer};
 
 mod common;
 
-use common::{ProcessedEntry, ShardInputHeader, ShardedRecord, ShardHeader, PackedIndexEntry, IndexHeader};
+use common::{ProcessedEntry, ShardInputHeader, ShardedRecord, ShardHeader, PackedIndexEntry, IndexHeader, index_config::QUERY_SEARCH_K};
 
 #[derive(FromArgs)]
 #[argh(description="Process scraper dump files")]
@@ -124,7 +124,6 @@ const SHARD_SPILL: usize = 2;
 const RECORD_PAD_SIZE: usize = 4096; // NVMe disk sector size
 const D_EMB: u32 = 1152;
 const EMPTY_LOOKUP: (u32, u64, u32) = (u32::MAX, 0, 0);
-const KNN_K: usize = 30;
 const BALANCE_WEIGHT: f64 = 0.2;
 const BATCH_SIZE: usize = 128;
 
@@ -373,7 +372,7 @@ fn main() -> Result<()> {
             }
 
             let index = queries_index.as_mut().context("need queries")?;
-            let knn_result = index.search(&knn_query, KNN_K)?;
+            let knn_result = index.search(&knn_query, QUERY_SEARCH_K)?;
 
             for (i, (x, embedding)) in batch.iter().enumerate() {
                 // closest matches first
@@ -386,7 +385,8 @@ fn main() -> Result<()> {
                 let entry = ShardedRecord {
                     id: count + i as u32,
                     vector: x.embedding.clone(),
-                    query_knns: knn_result.labels[i * KNN_K..(i + 1)*KNN_K].into_iter().map(|x| x.get().unwrap() as u32).collect()
+                    query_knns: knn_result.labels[i * QUERY_SEARCH_K..(i + 1)*QUERY_SEARCH_K].into_iter().flat_map(|x| x.get().map(|x| x as u32)).collect(),
+                    query_knns_distances: knn_result.distances[i * QUERY_SEARCH_K..(i + 1)*QUERY_SEARCH_K].into_iter().copied().collect()
                 };
                 let data = rmp_serde::to_vec(&entry)?;
                 for (_, file, shard_count, _shard_index) in shards[0..SHARD_SPILL].iter_mut() {
