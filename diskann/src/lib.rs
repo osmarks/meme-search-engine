@@ -289,13 +289,15 @@ pub fn build_graph(rng: &mut Rng, graph: &mut IndexGraph, medioid: u32, vecs: &V
         }
 
         {
-            let mut n = graph.out_neighbours_mut(sigma_i);
-            robust_prune(scratch, sigma_i, &mut *n, vecs, config);
+            let mut n = graph.out_neighbours(sigma_i).to_owned();
+            robust_prune(scratch, sigma_i, &mut n, vecs, config);
+            *graph.out_neighbours_mut(sigma_i) = n;
         }
 
         let neighbours = graph.out_neighbours(sigma_i).to_owned();
         for neighbour in neighbours {
-            let mut neighbour_neighbours = graph.out_neighbours_mut(neighbour);
+            // somewhat ugly deadlock avoidance hack - only hold writelock at end
+            let neighbour_neighbours = graph.out_neighbours(neighbour);
             // To cut down pruning time slightly, allow accumulating more neighbours than usual limit
             if neighbour_neighbours.len() == config.r_cap {
                 let mut n = neighbour_neighbours.to_vec();
@@ -303,7 +305,12 @@ pub fn build_graph(rng: &mut Rng, graph: &mut IndexGraph, medioid: u32, vecs: &V
                 merge_existing_neighbours(&mut scratch.visited_list, neighbour, &neighbour_neighbours, vecs, config);
                 merge_existing_neighbours(&mut scratch.visited_list, neighbour, &vec![sigma_i], vecs, config);
                 robust_prune(scratch, neighbour, &mut n, vecs, config);
+                std::mem::drop(neighbour_neighbours);
+                *graph.out_neighbours_mut(neighbour) = n;
             } else if !neighbour_neighbours.contains(&sigma_i) && neighbour_neighbours.len() < config.r_cap {
+                // we apparently cannot actually upgrade the read lock to a write lock
+                std::mem::drop(neighbour_neighbours);
+                let mut neighbour_neighbours = graph.out_neighbours_mut(neighbour);
                 neighbour_neighbours.push(sigma_i);
             }
         }
@@ -323,21 +330,50 @@ pub fn project_bipartite(rng: &mut Rng, graph: &mut IndexGraph, query_knns: &Vec
         scratch.visited.clear();
         scratch.visited_list.clear();
         scratch.neighbour_pre_buffer.clear();
+        //println!("fwd outsize {} {}", sigma_i, query_knns[sigma_i as usize].len());
         for &query_neighbour in query_knns[sigma_i as usize].iter() {
+            //println!("bwd outsize {} {}", query_neighbour, query_knns_bwd[query_neighbour as usize].len());
             for &projected_neighbour in query_knns_bwd[query_neighbour as usize].iter() {
                 if scratch.visited.insert(projected_neighbour) {
                     scratch.neighbour_pre_buffer.push(projected_neighbour);
                 }
             }
         }
+        //println!("shuffling {}", scratch.neighbour_pre_buffer.len());
         rng.shuffle(&mut scratch.neighbour_pre_buffer);
+        //println!("shuffled {}", scratch.neighbour_pre_buffer.len());
         scratch.neighbour_pre_buffer.truncate(config.maxc * 2);
         for (i, &projected_neighbour) in scratch.neighbour_pre_buffer.iter().enumerate() {
             let score = fast_dot(&vecs[sigma_i as usize], &vecs[projected_neighbour as usize], &vecs[scratch.neighbour_pre_buffer[(i + 1) % scratch.neighbour_pre_buffer.len()] as usize]);
             scratch.visited_list.push((projected_neighbour, score));
         }
-        let mut neighbours = graph.out_neighbours_mut(sigma_i);
-        robust_prune(scratch, sigma_i, &mut *neighbours, vecs, config);
+
+        {
+            let mut n = graph.out_neighbours(sigma_i).to_owned();
+            robust_prune(scratch, sigma_i, &mut n, vecs, config);
+            *graph.out_neighbours_mut(sigma_i) = n;
+        }
+        //println!("pruned {}/{}", graph.out_neighbours(sigma_i).len(), scratch.visited_list.len());
+
+        let neighbours = graph.out_neighbours(sigma_i).clone();
+        for neighbour in neighbours {
+            // as in Vamana algorithm
+            // TODO factor out common code
+            let neighbour_neighbours = graph.out_neighbours(neighbour);
+            if neighbour_neighbours.len() == config.r_cap {
+                let mut n = neighbour_neighbours.to_vec();
+                scratch.visited_list.clear();
+                merge_existing_neighbours(&mut scratch.visited_list, neighbour, &neighbour_neighbours, vecs, config);
+                merge_existing_neighbours(&mut scratch.visited_list, neighbour, &vec![sigma_i], vecs, config);
+                robust_prune(scratch, neighbour, &mut n, vecs, config);
+                std::mem::drop(neighbour_neighbours);
+                *graph.out_neighbours_mut(neighbour) = n;
+            } else if !neighbour_neighbours.contains(&sigma_i) && neighbour_neighbours.len() < config.r_cap {
+                std::mem::drop(neighbour_neighbours);
+                let mut neighbour_neighbours = graph.out_neighbours_mut(neighbour);
+                neighbour_neighbours.push(sigma_i);
+            }
+        }
     })
 }
 
