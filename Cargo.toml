@@ -3,7 +3,9 @@ name = "meme-search-engine"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[profile.release-with-debug]
+inherits = "release"
+debug = true
 
 [dependencies]
 tokio = { version = "1", features = ["full", "tracing"] }
@@ -44,6 +46,17 @@ compact_str = { version = "0.8.0-beta", features = ["serde"] }
 itertools = "0.13"
 async-recursion = "1"
 fast_image_resize = { version = "5", features = ["image"] }
+argh = "0.1"
+maud = "0.26"
+hamming = "0.1"
+seahash = "4"
+tracing-subscriber = "0.3"
+diskann = { path = "./diskann" }
+bytemuck = "1"
+bitcode = "0.6"
+simsimd = "6"
+foldhash = "0.1"
+memmap2 = "0.9"
 
 [[bin]]
 name = "reddit-dump"
@@ -56,3 +69,11 @@ path = "src/video_reader.rs"
 [[bin]]
 name = "dump-processor"
 path = "src/dump_processor.rs"
+
+[[bin]]
+name = "generate-index-shard"
+path = "src/generate_index_shard.rs"
+
+[[bin]]
+name = "query-disk-index"
+path = "src/query_disk_index.rs"
