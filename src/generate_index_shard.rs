@@ -1,6 +1,6 @@
 use anyhow::{Result, Context};
 use itertools::Itertools;
-use std::io::{BufReader, Write, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use rmp_serde::decode::Error as DecodeError;
 use std::fs;
 use diskann::{augment_bipartite, build_graph, project_bipartite, random_fill_graph, vector::{dot, VectorList}, IndexBuildConfig, IndexGraph, Timer};
@@ -11,6 +11,19 @@ mod common;
 use common::{ShardInputHeader, ShardedRecord, ShardHeader};
 
 const D_EMB: usize = 1152;
+
+fn report_degrees(graph: &IndexGraph) {
+    let mut total_degree = 0;
+    let mut degrees = Vec::with_capacity(graph.graph.len());
+    for out_neighbours in graph.graph.iter() {
+        let deg = out_neighbours.read().unwrap().len();
+        total_degree += deg;
+        degrees.push(deg);
+    }
+    degrees.sort_unstable();
+    println!("average degree {}", (total_degree as f32) / (graph.graph.len() as f32));
+    println!("median degree {}", degrees[degrees.len() / 2]);
+}
 
 fn main() -> Result<()> {
     let mut rng = fastrand::Rng::new();
@@ -43,7 +56,7 @@ fn main() -> Result<()> {
     let mut config = IndexBuildConfig {
         r: 64,
         r_cap: 80,
-        l: 256,
+        l: 300,
         maxc: 750,
         alpha: 65536
     };
@@ -66,6 +79,8 @@ fn main() -> Result<()> {
         random_fill_graph(&mut rng, &mut graph, config.r);
     }
 
+    report_degrees(&graph);
+
     let medioid = vecs.iter().position_max_by_key(|&v| {
         dot(v, &centroid_fp16)
     }).unwrap() as u32;
@@ -75,11 +90,15 @@ fn main() -> Result<()> {
         build_graph(&mut rng, &mut graph, medioid, &vecs, config);
     }
 
+    report_degrees(&graph);
+
     {
         let _timer = Timer::new("second pass");
-        config.alpha = 80000;
+        config.alpha = 60000;
         build_graph(&mut rng, &mut graph, medioid, &vecs, config);
     }
+
+    report_degrees(&graph);
 
     std::mem::drop(vecs);
 
