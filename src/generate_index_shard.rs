@@ -56,8 +56,8 @@ fn main() -> Result<()> {
     let mut config = IndexBuildConfig {
         r: 64,
         r_cap: 80,
-        l: 300,
-        maxc: 750,
+        l: 500,
+        maxc: 950,
         alpha: 65536
     };
 
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
     {
         let _timer = Timer::new("second pass");
         config.alpha = 60000;
-        build_graph(&mut rng, &mut graph, medioid, &vecs, config);
+        //build_graph(&mut rng, &mut graph, medioid, &vecs, config);
     }
 
     report_degrees(&graph);
@@ -115,7 +115,7 @@ fn main() -> Result<()> {
 
     {
         let _timer = Timer::new("augment bipartite");
-        augment_bipartite(&mut rng, &mut graph, query_knns, query_knns_bwd, config);
+        //augment_bipartite(&mut rng, &mut graph, query_knns, query_knns_bwd, config);
     }
 
     let len = original_ids.len();
