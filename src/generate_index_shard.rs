@@ -42,7 +42,6 @@ fn main() -> Result<()> {
 
     let mut config = IndexBuildConfig {
         r: 64,
-        r_cap: 64,
         l: 200,
         maxc: 750,
         alpha: 65300
@@ -54,7 +53,7 @@ fn main() -> Result<()> {
         length: original_ids.len()
     };
 
-    let mut graph = IndexGraph::empty(original_ids.len(), config.r_cap);
+    let mut graph = IndexGraph::empty(original_ids.len(), config.r);
 
     {
         //let _timer = Timer::new("project bipartite");

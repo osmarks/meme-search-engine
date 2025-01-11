@@ -55,7 +55,6 @@ impl IndexGraph {
 #[derive(Clone, Copy, Debug)]
 pub struct IndexBuildConfig {
     pub r: usize,
-    pub r_cap: usize,
     pub l: usize,
     pub maxc: usize,
     pub alpha: i64
@@ -354,7 +353,7 @@ pub fn augment_bipartite(rng: &mut Rng, graph: &mut IndexGraph, query_knns: Vec<
     sigmas.into_par_iter().for_each_init(|| rng.lock().unwrap().fork(), |rng, sigma_i| {
         let mut neighbours = graph.out_neighbours_mut(sigma_i);
         let mut i = 0;
-        while neighbours.len() < config.r_cap && i < 100 {
+        while neighbours.len() < config.r && i < 100 {
             let query_neighbour = *rng.choice(&query_knns[sigma_i as usize]).unwrap();
             let projected_neighbour = *rng.choice(&query_knns_bwd[query_neighbour as usize]).unwrap();
             if !neighbours.contains(&projected_neighbour) {
