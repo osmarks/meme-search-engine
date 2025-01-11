@@ -15,4 +15,5 @@ diskann/target
 *.bin
 *.msgpack
 */flamegraph.svg
-*/*.bin
+*.hdf5
+*.v
