@@ -41,7 +41,7 @@ fn main() -> Result<()> {
     }
 
     let mut config = IndexBuildConfig {
-        r: 64,
+        r: 40,
         l: 200,
         maxc: 750,
         alpha: 65300

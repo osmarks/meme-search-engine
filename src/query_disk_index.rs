@@ -209,15 +209,12 @@ fn main() -> Result<()> {
 
             scratch.visited_list.sort_by_key(|x| -x.1);
             for (i, (id, distance, url, shards)) in scratch.visited_list.iter().take(20).enumerate() {
-                if args.verbose {
-                    println!("index scan: {} {} {} {:?}", id, distance, url, shards);
-                };
                 let found_id = match matches.binary_search(&(*id, 0)) {
                     Ok(pos) => pos,
                     Err(pos) => pos
                 };
                 if args.verbose {
-                    println!("rank {}", matches[found_id].1);
+                    println!("index scan: {} {} {} {:?}; rank {}", id, distance, url, shards, matches[found_id].1 + 1);
                 };
                 top_ranks[i] = std::cmp::min(top_ranks[i], matches[found_id].1);
             }
