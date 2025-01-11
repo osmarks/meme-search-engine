@@ -55,7 +55,6 @@ impl IndexGraph {
 #[derive(Clone, Copy, Debug)]
 pub struct IndexBuildConfig {
     pub r: usize,
-    pub r_cap: usize,
     pub l: usize,
     pub maxc: usize,
     pub alpha: i64
@@ -146,7 +145,14 @@ impl NeighbourBuffer {
         self.scores.truncate(self.size);
         self.visited.truncate(self.size);
 
-        self.next_unvisited = Some(loc as u32);
+        match self.next_unvisited {
+            Some(ref mut next_unvisited) => {
+                *next_unvisited = (loc as u32).min(*next_unvisited);
+            },
+            None => {
+                self.next_unvisited = Some(loc as u32);
+            }
+        }
     }
 
     pub fn clear(&mut self) {
@@ -194,7 +200,6 @@ pub fn greedy_search(scratch: &mut Scratch, start: u32, query: VectorRef, vecs: 
     let mut counters = GreedySearchCounters { distances: 0 };
 
     while let Some(pt) = scratch.neighbour_buffer.next_unvisited() {
-        //println!("pt {} {:?}", pt, graph.out_neighbours(pt));
         scratch.neighbour_pre_buffer.clear();
         for &neighbour in graph.out_neighbours(pt).iter() {
             if scratch.visited.insert(neighbour) {
@@ -299,7 +304,7 @@ pub fn build_graph(rng: &mut Rng, graph: &mut IndexGraph, medioid: u32, vecs: &V
             // somewhat ugly deadlock avoidance hack - only hold writelock at end
             let neighbour_neighbours = graph.out_neighbours(neighbour);
             // To cut down pruning time slightly, allow accumulating more neighbours than usual limit
-            if neighbour_neighbours.len() == config.r_cap {
+            if neighbour_neighbours.len() == config.r {
                 let mut n = neighbour_neighbours.to_vec();
                 scratch.visited_list.clear();
                 merge_existing_neighbours(&mut scratch.visited_list, neighbour, &neighbour_neighbours, vecs, config);
@@ -307,7 +312,7 @@ pub fn build_graph(rng: &mut Rng, graph: &mut IndexGraph, medioid: u32, vecs: &V
                 robust_prune(scratch, neighbour, &mut n, vecs, config);
                 std::mem::drop(neighbour_neighbours);
                 *graph.out_neighbours_mut(neighbour) = n;
-            } else if !neighbour_neighbours.contains(&sigma_i) && neighbour_neighbours.len() < config.r_cap {
+            } else if !neighbour_neighbours.contains(&sigma_i) && neighbour_neighbours.len() < config.r {
                 // we apparently cannot actually upgrade the read lock to a write lock
                 std::mem::drop(neighbour_neighbours);
                 let mut neighbour_neighbours = graph.out_neighbours_mut(neighbour);
@@ -360,7 +365,7 @@ pub fn project_bipartite(rng: &mut Rng, graph: &mut IndexGraph, query_knns: &Vec
             // as in Vamana algorithm
             // TODO factor out common code
             let neighbour_neighbours = graph.out_neighbours(neighbour);
-            if neighbour_neighbours.len() == config.r_cap {
+            if neighbour_neighbours.len() == config.r {
                 let mut n = neighbour_neighbours.to_vec();
                 scratch.visited_list.clear();
                 merge_existing_neighbours(&mut scratch.visited_list, neighbour, &neighbour_neighbours, vecs, config);
@@ -368,7 +373,7 @@ pub fn project_bipartite(rng: &mut Rng, graph: &mut IndexGraph, query_knns: &Vec
                 robust_prune(scratch, neighbour, &mut n, vecs, config);
                 std::mem::drop(neighbour_neighbours);
                 *graph.out_neighbours_mut(neighbour) = n;
-            } else if !neighbour_neighbours.contains(&sigma_i) && neighbour_neighbours.len() < config.r_cap {
+            } else if !neighbour_neighbours.contains(&sigma_i) && neighbour_neighbours.len() < config.r {
                 std::mem::drop(neighbour_neighbours);
                 let mut neighbour_neighbours = graph.out_neighbours_mut(neighbour);
                 neighbour_neighbours.push(sigma_i);
@@ -386,7 +391,7 @@ pub fn augment_bipartite(rng: &mut Rng, graph: &mut IndexGraph, query_knns: Vec<
     sigmas.into_par_iter().for_each_init(|| rng.lock().unwrap().fork(), |rng, sigma_i| {
         let mut neighbours = graph.out_neighbours_mut(sigma_i);
         let mut i = 0;
-        while neighbours.len() < config.r_cap && i < 100 {
+        while neighbours.len() < config.r && i < 100 {
             let query_neighbour = *rng.choice(&query_knns[sigma_i as usize]).unwrap();
             let projected_neighbour = *rng.choice(&query_knns_bwd[query_neighbour as usize]).unwrap();
             if !neighbours.contains(&projected_neighbour) {
@@ -422,4 +427,19 @@ impl Drop for Timer {
     fn drop(&mut self) {
         println!("{}: {:.2}s", self.0, self.1.elapsed().as_secs_f32());
     }
+}
+
+pub fn report_degrees(graph: &IndexGraph) {
+    let mut total_degree = 0;
+    let mut degrees = Vec::with_capacity(graph.graph.len());
+    for out_neighbours in graph.graph.iter() {
+        let deg = out_neighbours.read().unwrap().len();
+        total_degree += deg;
+        degrees.push(deg);
+    }
+    degrees.sort_unstable();
+    println!("average degree {}", (total_degree as f64) / (graph.graph.len() as f64));
+    println!("median degree {}", degrees[degrees.len() / 2]);
+    println!("min degree {}", degrees[0]);
+    println!("max degree {}", degrees[degrees.len() - 1]);
 }

@@ -7,7 +7,7 @@ use std::{io::Read, time::Instant};
 use anyhow::Result;
 use half::f16;
 
-use diskann::{build_graph, IndexBuildConfig, medioid, IndexGraph, greedy_search, Scratch, vector::{fast_dot, SCALE, dot, VectorList, self}, Timer};
+use diskann::{build_graph, IndexBuildConfig, medioid, IndexGraph, greedy_search, Scratch, vector::{fast_dot, SCALE, dot, VectorList, self}, Timer, report_degrees, random_fill_graph};
 use simsimd::SpatialSimilarity;
 
 const D_EMB: usize = 1152;
@@ -26,12 +26,13 @@ const PQ_TEST_SIZE: usize = 1000;
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    /*/
     {
         let file = std::fs::File::open("opq.msgpack")?;
         let codec: vector::ProductQuantizer = rmp_serde::from_read(file)?;
         let input = load_file("embeddings.bin", Some(D_EMB * PQ_TEST_SIZE))?.data.into_iter().map(|a| a.to_f32()).collect::<Vec<_>>();
         let codes = codec.quantize_batch(&input);
-        println!("{:?}", codes);
+        //println!("{:?}", codes);
         let raw_query = load_file("query.bin", Some(D_EMB))?.data.into_iter().map(|a| a.to_f32()).collect::<Vec<_>>();
         let query = codec.preprocess_query(&raw_query);
         let mut real_scores = vec![];
@@ -41,17 +42,17 @@ fn main() -> Result<()> {
         let pq_scores = codec.asymmetric_dot_product(&query, &codes);
         for (x, y) in real_scores.iter().zip(pq_scores.iter()) {
             let y = (*y as f32) / SCALE;
-            println!("{} {} {} {}", x, y, x - y, (x - y) / x);
+            //println!("{} {} {} {}", x, y, x - y, (x - y) / x);
         }
-    }
+    }*/
 
     let mut rng = fastrand::Rng::with_seed(1);
 
-    let n = 100000;
+    let n = 100_000;
     let vecs = {
         let _timer = Timer::new("loaded vectors");
 
-        &load_file("embeddings.bin", Some(D_EMB * n))?
+        &load_file("query.bin", Some(D_EMB * n))?
     };
 
     let (graph, medioid) = {
@@ -59,10 +60,9 @@ fn main() -> Result<()> {
 
         let mut config = IndexBuildConfig {
             r: 64,
-            r_cap: 80,
-            l: 128,
+            l: 192,
             maxc: 750,
-            alpha: 65536,
+            alpha: 65200,
         };
 
         let mut graph = IndexGraph::random_r_regular(&mut rng, vecs.len(), config.r, config.r_cap);
@@ -70,8 +70,11 @@ fn main() -> Result<()> {
         let medioid = medioid(&vecs);
 
         build_graph(&mut rng, &mut graph, medioid, &vecs, config);
-        config.alpha = 58000;
-        build_graph(&mut rng, &mut graph, medioid, &vecs, config);
+        report_degrees(&graph);
+        //random_fill_graph(&mut rng, &mut graph, config.r);
+        //config.alpha = 65536;
+        //build_graph(&mut rng, &mut graph, medioid, &vecs, config);
+        report_degrees(&graph);
 
         (graph, medioid)
     };
@@ -82,8 +85,6 @@ fn main() -> Result<()> {
         edge_ctr += adjlist.read().unwrap().len();
     }
 
-    println!("average degree: {}", edge_ctr as f32 / graph.graph.len() as f32);
-
     let time = Instant::now();
     let mut recall = 0;
     let mut cmps_ctr = 0;
@@ -91,7 +92,6 @@ fn main() -> Result<()> {
 
     let mut config = IndexBuildConfig {
         r: 64,
-        r_cap: 64,
         l: 50,
         alpha: 65536,
         maxc: 0,

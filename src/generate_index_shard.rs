@@ -1,10 +1,10 @@
 use anyhow::{Result, Context};
 use itertools::Itertools;
-use std::io::{BufReader, Write, BufWriter, Seek};
-use rmp_serde::decode::Error as DecodeError;
-use std::fs;
 use std::collections::BinaryHeap;
-use diskann::{augment_bipartite, build_graph, project_bipartite, random_fill_graph, vector::{dot, VectorList, scale_dot_result}, IndexBuildConfig, IndexGraph, Timer};
+use std::io::{BufReader, BufWriter, Write};
+use std::fs;
+use rmp_serde::decode::{Error as DecodeError, from_read};
+use diskann::{augment_bipartite, build_graph, project_bipartite, random_fill_graph, vector::{dot, VectorList, scale_dot_result}, IndexBuildConfig, IndexGraph, Timer, report_degrees};
 use half::f16;
 
 mod common;
@@ -12,19 +12,6 @@ mod common;
 use common::{index_config::{self, QUERY_REVERSE_K}, ShardHeader, ShardInputHeader, ShardedRecord};
 
 const D_EMB: usize = 1152;
-
-fn report_degrees(graph: &IndexGraph) {
-    let mut total_degree = 0;
-    let mut degrees = Vec::with_capacity(graph.graph.len());
-    for out_neighbours in graph.graph.iter() {
-        let deg = out_neighbours.read().unwrap().len();
-        total_degree += deg;
-        degrees.push(deg);
-    }
-    degrees.sort_unstable();
-    println!("average degree {}", (total_degree as f32) / (graph.graph.len() as f32));
-    println!("median degree {}", degrees[degrees.len() / 2]);
-}
 
 fn main() -> Result<()> {
     let mut rng = fastrand::Rng::new();
@@ -98,7 +85,7 @@ fn main() -> Result<()> {
         length: original_ids.len()
     };
 
-    let mut graph = IndexGraph::empty(original_ids.len(), config.r_cap);
+    let mut graph = IndexGraph::empty(original_ids.len(), config.r);
 
     {
         let _timer = Timer::new("project bipartite");
@@ -121,14 +108,6 @@ fn main() -> Result<()> {
     {
         let _timer = Timer::new("first pass");
         config.alpha = common::index_config::FIRST_PASS_ALPHA;
-        build_graph(&mut rng, &mut graph, medioid, &vecs, config);
-    }
-
-    report_degrees(&graph);
-
-    {
-        let _timer = Timer::new("second pass");
-        config.alpha = common::index_config::SECOND_PASS_ALPHA;
         build_graph(&mut rng, &mut graph, medioid, &vecs, config);
     }
 

@@ -7,7 +7,6 @@ use std::fs;
 use base64::Engine;
 use argh::FromArgs;
 use chrono::{TimeZone, Utc, DateTime};
-use std::collections::VecDeque;
 use itertools::Itertools;
 use foldhash::{HashSet, HashSetExt};
 use half::f16;
@@ -23,9 +22,17 @@ use common::{PackedIndexEntry, IndexHeader};
 #[argh(description="Query disk index")]
 struct CLIArguments {
     #[argh(positional)]
-    query_vector: String,
-    #[argh(positional)]
-    index_path: String
+    index_path: String,
+    #[argh(option, short='q', description="query vector in base64")]
+    query_vector_base64: Option<String>,
+    #[argh(option, short='f', description="file of FP16 query vectors")]
+    query_vector_file: Option<String>,
+    #[argh(switch, short='v', description="verbose")]
+    verbose: bool,
+    #[argh(option, short='n', description="stop at n queries")]
+    n: Option<usize>,
+    #[argh(switch, description="always use full-precision vectors (slow)")]
+    disable_pq: bool
 }
 
 fn read_node(id: u32, data_file: &mut fs::File, header: &IndexHeader) -> Result<PackedIndexEntry> {
@@ -56,7 +63,7 @@ struct IndexRef<'a> {
     pq_code_size: usize
 }
 
-fn greedy_search(scratch: &mut Scratch, start: u32, query: &[f16], query_preprocessed: &DistanceLUT, index: IndexRef) -> Result<(usize, usize)> {
+fn greedy_search(scratch: &mut Scratch, start: u32, query: &[f16], query_preprocessed: &DistanceLUT, index: IndexRef, disable_pq: bool) -> Result<(usize, usize)> {
     scratch.visited.clear();
     scratch.neighbour_buffer.clear();
     scratch.visited_list.clear();
@@ -88,24 +95,48 @@ fn greedy_search(scratch: &mut Scratch, start: u32, query: &[f16], query_preproc
         }
         let approx_scores = index.header.quantizer.asymmetric_dot_product(&query_preprocessed, &pq_codes);
         for (i, &neighbour) in scratch.neighbour_pre_buffer.iter().enumerate() {
-            //let next_neighbour = scratch.neighbour_pre_buffer[(i + 1) % scratch.neighbour_pre_buffer.len()]; // TODO
-            //let node = read_node(neighbour, index.data_file, index.header)?;
-            //let vector = bytemuck::cast_slice(&node.vector);
-            //let distance = fast_dot_noprefetch(query, &vector);
-            pq_cmps += 1;
-            scratch.neighbour_buffer.insert(neighbour, approx_scores[i]);
-            //scratch.neighbour_buffer.insert(neighbour, distance);
+            if disable_pq {
+                //let next_neighbour = scratch.neighbour_pre_buffer[(i + 1) % scratch.neighbour_pre_buffer.len()]; // TODO
+                let node = read_node(neighbour, index.data_file, index.header)?;
+                let vector = bytemuck::cast_slice(&node.vector);
+                let distance = fast_dot_noprefetch(query, &vector);
+                scratch.neighbour_buffer.insert(neighbour, distance);
+            } else {
+                scratch.neighbour_buffer.insert(neighbour, approx_scores[i]);
+                pq_cmps += 1;
+            }
         }
     }
 
     Ok((cmps, pq_cmps))
 }
 
+fn summary_stats(ranks: &mut [usize]) {
+    let sum = ranks.iter().sum::<usize>();
+    let mean = sum as f64 / ranks.len() as f64 + 1.0;
+    ranks.sort_unstable();
+    let median = ranks[ranks.len() / 2] + 1;
+    let harmonic_mean = ranks.iter().map(|x| 1.0 / ((x+1) as f64)).sum::<f64>() / ranks.len() as f64;
+    println!("median {} mean {} max {} min {} harmonic mean {}", median, mean, ranks[ranks.len() - 1] + 1, ranks[0] + 1, 1.0 / harmonic_mean);
+}
+
 fn main() -> Result<()> {
     let args: CLIArguments = argh::from_env();
 
-    let query_vector: Vec<f16> = common::chunk_fp16_buffer(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(args.query_vector.as_bytes()).context("invalid base64")?);
-    let query_vector_fp32 = query_vector.iter().map(|x| x.to_f32()).collect::<Vec<f32>>();
+    let mut queries = vec![];
+
+    if let Some(query_vector_base64) = args.query_vector_base64 {
+        let query_vector: Vec<f16> = common::chunk_fp16_buffer(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(query_vector_base64.as_bytes()).context("invalid base64")?);
+        queries.push(query_vector);
+    }
+    if let Some(query_vector_file) = args.query_vector_file {
+        let query_vectors = fs::read(query_vector_file)?;
+        queries.extend(common::chunk_fp16_buffer(&query_vectors).chunks(1152).map(|x| x.to_vec()).collect::<Vec<_>>());
+    }
+
+    if let Some(n) = args.n {
+        queries.truncate(n);
+    }
 
     let index_path = PathBuf::from(&args.index_path);
     let header: IndexHeader = rmp_serde::from_read(BufReader::new(fs::File::open(index_path.join("index.msgpack"))?))?;
@@ -117,57 +148,90 @@ fn main() -> Result<()> {
         MmapOptions::new().populate().map(&pq_codes_file)?
     };
 
-    let query_preprocessed = header.quantizer.preprocess_query(&query_vector_fp32);
-
     println!("{} items {} dead {} shards", header.count, header.dead_count, header.shards.len());
 
-    // TODO slightly dubious
-    let selected_shard = header.shards.iter().position_max_by_key(|x| {
-        scale_dot_result_f64(SpatialSimilarity::dot(&x.0, &query_vector_fp32).unwrap())
-    }).unwrap();
+    let mut top_20_ranks_best_shard = vec![];
+    let mut top_rank_best_shard = vec![];
 
-    println!("best shard is {}", selected_shard);
+    for query_vector in queries.iter() {
+        let query_vector_fp32 = query_vector.iter().map(|x| x.to_f32()).collect::<Vec<f32>>();
+        let query_preprocessed = header.quantizer.preprocess_query(&query_vector_fp32);
 
-    for shard in 0..header.shards.len() {
-        let selected_start = header.shards[shard].1;
+        // TODO slightly dubious
+        let selected_shard = header.shards.iter().position_max_by_key(|x| {
+            scale_dot_result_f64(SpatialSimilarity::dot(&x.0, &query_vector_fp32).unwrap())
+        }).unwrap();
 
-        let mut scratch = Scratch {
-            visited: HashSet::new(),
-            neighbour_buffer: NeighbourBuffer::new(5000),
-            neighbour_pre_buffer: Vec::new(),
-            visited_list: Vec::new()
-        };
-
-        //let query_vector = diskann::vector::quantize(&query_vector, &header.quantizer, &mut rng);
-        let cmps = greedy_search(&mut scratch, selected_start, &query_vector, &query_preprocessed, IndexRef {
-            data_file: &mut data_file,
-            header: &header,
-            pq_codes: &pq_codes,
-            pq_code_size: header.quantizer.n_dims / header.quantizer.n_dims_per_code,
-        })?;
-
-        println!("index scan {}: {:?} cmps", shard, cmps);
-
-        scratch.visited_list.sort_by_key(|x| -x.1);
-        for (id, distance, url, shards) in scratch.visited_list.iter().take(20) {
-            println!("index scan: {} {} {} {:?}", id, distance, url, shards);
+        if args.verbose {
+            println!("selected shard is {}", selected_shard);
         }
-        println!("");
+
+        let mut matches = vec![];
+        // brute force scan
+        for i in 0..header.count {
+            let node = read_node(i, &mut data_file, &header)?;
+            //println!("{} {}", i, node.url);
+            let vector = bytemuck::cast_slice(&node.vector);
+            matches.push((i, fast_dot_noprefetch(&query_vector, &vector), node.url, node.shards));
+        }
+
+        matches.sort_unstable_by_key(|x| -x.1);
+        let mut matches = matches.into_iter().enumerate().map(|(i, (id, distance, url, shards))| (id, i)).collect::<Vec<_>>();
+        matches.sort_unstable();
+
+        /*for (id, distance, url, shards) in matches.iter().take(20) {
+            println!("brute force: {} {} {} {:?}", id, distance, url, shards);
+        }*/
+
+        let mut top_ranks = vec![usize::MAX; 20];
+
+        for shard in 0..header.shards.len() {
+            let selected_start = header.shards[shard].1;
+
+            let mut scratch = Scratch {
+                visited: HashSet::new(),
+                neighbour_buffer: NeighbourBuffer::new(300),
+                neighbour_pre_buffer: Vec::new(),
+                visited_list: Vec::new()
+            };
+
+            //let query_vector = diskann::vector::quantize(&query_vector, &header.quantizer, &mut rng);
+            let cmps = greedy_search(&mut scratch, selected_start, &query_vector, &query_preprocessed, IndexRef {
+                data_file: &mut data_file,
+                header: &header,
+                pq_codes: &pq_codes,
+                pq_code_size: header.quantizer.n_dims / header.quantizer.n_dims_per_code,
+            }, args.disable_pq)?;
+
+            if args.verbose {
+                println!("index scan {}: {:?} cmps", shard, cmps);
+            }
+
+            scratch.visited_list.sort_by_key(|x| -x.1);
+            for (i, (id, distance, url, shards)) in scratch.visited_list.iter().take(20).enumerate() {
+                if args.verbose {
+                    println!("index scan: {} {} {} {:?}", id, distance, url, shards);
+                };
+                let found_id = match matches.binary_search(&(*id, 0)) {
+                    Ok(pos) => pos,
+                    Err(pos) => pos
+                };
+                if args.verbose {
+                    println!("rank {}", matches[found_id].1);
+                };
+                top_ranks[i] = std::cmp::min(top_ranks[i], matches[found_id].1);
+            }
+            if args.verbose { println!("") }
+        }
+
+        top_rank_best_shard.push(top_ranks[0]);
+        top_20_ranks_best_shard.extend(top_ranks);
     }
 
-    let mut matches = vec![];
-    // brute force scan
-    for i in 0..header.count {
-        let node = read_node(i, &mut data_file, &header)?;
-        //println!("{} {}", i, node.url);
-        let vector = bytemuck::cast_slice(&node.vector);
-        matches.push((i, fast_dot_noprefetch(&query_vector, &vector), node.url, node.shards));
-    }
-
-    matches.sort_by_key(|x| -x.1);
-    for (id, distance, url, shards) in matches.iter().take(20) {
-        println!("brute force: {} {} {} {:?}", id, distance, url, shards);
-    }
+    println!("ranks of top 20:");
+    summary_stats(&mut top_20_ranks_best_shard);
+    println!("ranks of top 1:");
+    summary_stats(&mut top_rank_best_shard);
 
     Ok(())
 }

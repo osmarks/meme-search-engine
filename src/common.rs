@@ -173,18 +173,17 @@ pub mod index_config {
     use diskann::IndexBuildConfig;
 
     pub const BASE_CONFIG: IndexBuildConfig = IndexBuildConfig {
-        r: 64,
-        r_cap: 80,
-        l: 500,
-        maxc: 750,
-        alpha: 60000
+        r: 40,
+        l: 200,
+        maxc: 900,
+        alpha: 65200
     };
 
-    pub const PROJECTION_CUT_POINT: usize = 1;
+    pub const PROJECTION_CUT_POINT: usize = 3;
 
-    pub const FIRST_PASS_ALPHA: i64 = 65536;
+    pub const FIRST_PASS_ALPHA: i64 = 65200;
 
-    pub const SECOND_PASS_ALPHA: i64 = 62000;
+    //pub const SECOND_PASS_ALPHA: i64 = 62000;
 
     pub const QUERY_SEARCH_K: usize = 200; // we want each query to have QUERY_REVERSE_K results, but some queries are likely more common than others in the top-k lists, so oversample a bit
     pub const QUERY_REVERSE_K: usize = 100;

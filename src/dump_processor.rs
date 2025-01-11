@@ -55,7 +55,7 @@ struct CLIArguments {
     #[argh(switch, short='t', description="print titles")]
     titles: bool,
     #[argh(option, description="truncate centroids list")]
-    clip_centroids: Option<usize>,
+    clip_shards: Option<usize>,
     #[argh(switch, description="print original linked URL")]
     original_url: bool,
     #[argh(option, short='q', description="product quantization codec path")]
@@ -179,7 +179,7 @@ fn main() -> Result<()> {
         let centroids_data = fs::read(centroids).context("read centroids file")?;
         let mut centroids_data = common::decode_fp16_buffer(&centroids_data);
 
-        if let Some(clip) = args.clip_centroids {
+        if let Some(clip) = args.clip_shards {
             centroids_data.truncate(clip * D_EMB as usize);
         }
 
@@ -208,6 +208,14 @@ fn main() -> Result<()> {
             let path = file.path();
             let filename = path.file_name().unwrap().to_str().unwrap();
             let (fst, snd) = filename.split_once(".").unwrap();
+
+            let id: u32 = str::parse(fst)?;
+            if let Some(clip) = args.clip_shards {
+                if id >= (clip as u32) {
+                    continue;
+                }
+            }
+
             if snd == "shard-header.msgpack" {
                 let header: ShardHeader = rmp_serde::from_read(BufReader::new(fs::File::open(path)?))?;
                 if original_ids_to_shards.len() < (header.max as usize + 1) {
@@ -237,7 +245,6 @@ fn main() -> Result<()> {
                 shard_id_mappings.push((header.id, header.mapping));
             } else if snd == "shard.bin" {
                 let file = fs::File::open(&path).context("open shard file")?;
-                let id: u32 = str::parse(fst)?;
                 files.push((id, file));
             }
         }
@@ -245,11 +252,16 @@ fn main() -> Result<()> {
         files.sort_by_key(|(id, _)| *id);
         shard_id_mappings.sort_by_key(|(id, _)| *id);
 
-        let read_out_vertices =move |id: u32| -> Result<(Vec<u32>, Vec<u32>)> {
+
+        let read_out_vertices = move |id: u32| -> Result<(Vec<u32>, Vec<u32>)> {
             let mut out_vertices: Vec<u32> = vec![];
             let mut shards: Vec<u32> = vec![];
             // look up each location in shard files
             for &(shard, offset, len) in original_ids_to_shards[id as usize].iter() {
+                if (shard, offset, len) == EMPTY_LOOKUP {
+                    continue;
+                }
+
                 shards.push(shard);
                 let shard = shard as usize;
                 // this random access is almost certainly rather slow
@@ -257,7 +269,7 @@ fn main() -> Result<()> {
                 files[shard].1.seek(SeekFrom::Start(offset))?;
                 let mut buf = vec![0; len as usize];
                 files[shard].1.read_exact(&mut buf)?;
-                let s: &mut [u32] = bytemuck::cast_slice_mut(&mut *buf);
+                let mut s: Vec<u32> = bytemuck::allocation::pod_collect_to_vec(&*buf);
                 for within_shard_id in s.iter_mut() {
                     *within_shard_id = shard_id_mappings[shard].1[*within_shard_id as usize];
                 }
