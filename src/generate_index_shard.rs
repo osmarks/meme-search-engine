@@ -3,7 +3,7 @@ use itertools::Itertools;
 use std::io::{BufReader, BufWriter, Write};
 use rmp_serde::decode::Error as DecodeError;
 use std::fs;
-use diskann::{augment_bipartite, build_graph, project_bipartite, random_fill_graph, vector::{dot, VectorList}, IndexBuildConfig, IndexGraph, Timer};
+use diskann::{augment_bipartite, build_graph, project_bipartite, random_fill_graph, vector::{dot, VectorList}, IndexBuildConfig, IndexGraph, Timer, report_degrees};
 use half::f16;
 
 mod common;
@@ -11,19 +11,6 @@ mod common;
 use common::{ShardInputHeader, ShardedRecord, ShardHeader};
 
 const D_EMB: usize = 1152;
-
-fn report_degrees(graph: &IndexGraph) {
-    let mut total_degree = 0;
-    let mut degrees = Vec::with_capacity(graph.graph.len());
-    for out_neighbours in graph.graph.iter() {
-        let deg = out_neighbours.read().unwrap().len();
-        total_degree += deg;
-        degrees.push(deg);
-    }
-    degrees.sort_unstable();
-    println!("average degree {}", (total_degree as f32) / (graph.graph.len() as f32));
-    println!("median degree {}", degrees[degrees.len() / 2]);
-}
 
 fn main() -> Result<()> {
     let mut rng = fastrand::Rng::new();
@@ -55,10 +42,10 @@ fn main() -> Result<()> {
 
     let mut config = IndexBuildConfig {
         r: 64,
-        r_cap: 80,
-        l: 500,
-        maxc: 950,
-        alpha: 65536
+        r_cap: 64,
+        l: 200,
+        maxc: 750,
+        alpha: 65300
     };
 
     let vecs = VectorList {
@@ -93,12 +80,12 @@ fn main() -> Result<()> {
     report_degrees(&graph);
 
     {
-        let _timer = Timer::new("second pass");
-        config.alpha = 60000;
+        //let _timer = Timer::new("second pass");
+        //config.alpha = 62000;
         //build_graph(&mut rng, &mut graph, medioid, &vecs, config);
     }
 
-    report_degrees(&graph);
+    //report_degrees(&graph);
 
     std::mem::drop(vecs);
 
@@ -115,7 +102,7 @@ fn main() -> Result<()> {
 
     {
         let _timer = Timer::new("augment bipartite");
-        //augment_bipartite(&mut rng, &mut graph, query_knns, query_knns_bwd, config);
+        augment_bipartite(&mut rng, &mut graph, query_knns, query_knns_bwd, config);
     }
 
     let len = original_ids.len();

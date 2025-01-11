@@ -146,7 +146,14 @@ impl NeighbourBuffer {
         self.scores.truncate(self.size);
         self.visited.truncate(self.size);
 
-        self.next_unvisited = Some(loc as u32);
+        match self.next_unvisited {
+            Some(ref mut next_unvisited) => {
+                *next_unvisited = (loc as u32).min(*next_unvisited);
+            },
+            None => {
+                self.next_unvisited = Some(loc as u32);
+            }
+        }
     }
 
     pub fn clear(&mut self) {
@@ -194,7 +201,6 @@ pub fn greedy_search(scratch: &mut Scratch, start: u32, query: VectorRef, vecs: 
     let mut counters = GreedySearchCounters { distances: 0 };
 
     while let Some(pt) = scratch.neighbour_buffer.next_unvisited() {
-        //println!("pt {} {:?}", pt, graph.out_neighbours(pt));
         scratch.neighbour_pre_buffer.clear();
         for &neighbour in graph.out_neighbours(pt).iter() {
             if scratch.visited.insert(neighbour) {
@@ -296,14 +302,12 @@ pub fn build_graph(rng: &mut Rng, graph: &mut IndexGraph, medioid: u32, vecs: &V
         let neighbours = graph.out_neighbours(sigma_i).to_owned();
         for neighbour in neighbours {
             let mut neighbour_neighbours = graph.out_neighbours_mut(neighbour);
-            // To cut down pruning time slightly, allow accumulating more neighbours than usual limit
-            if neighbour_neighbours.len() == config.r_cap {
-                let mut n = neighbour_neighbours.to_vec();
+            if neighbour_neighbours.len() == config.r {
                 scratch.visited_list.clear();
                 merge_existing_neighbours(&mut scratch.visited_list, neighbour, &neighbour_neighbours, vecs, config);
                 merge_existing_neighbours(&mut scratch.visited_list, neighbour, &vec![sigma_i], vecs, config);
-                robust_prune(scratch, neighbour, &mut n, vecs, config);
-            } else if !neighbour_neighbours.contains(&sigma_i) && neighbour_neighbours.len() < config.r_cap {
+                robust_prune(scratch, neighbour, &mut neighbour_neighbours, vecs, config);
+            } else if !neighbour_neighbours.contains(&sigma_i) && neighbour_neighbours.len() < config.r {
                 neighbour_neighbours.push(sigma_i);
             }
         }
@@ -386,4 +390,19 @@ impl Drop for Timer {
     fn drop(&mut self) {
         println!("{}: {:.2}s", self.0, self.1.elapsed().as_secs_f32());
     }
+}
+
+pub fn report_degrees(graph: &IndexGraph) {
+    let mut total_degree = 0;
+    let mut degrees = Vec::with_capacity(graph.graph.len());
+    for out_neighbours in graph.graph.iter() {
+        let deg = out_neighbours.read().unwrap().len();
+        total_degree += deg;
+        degrees.push(deg);
+    }
+    degrees.sort_unstable();
+    println!("average degree {}", (total_degree as f64) / (graph.graph.len() as f64));
+    println!("median degree {}", degrees[degrees.len() / 2]);
+    println!("min degree {}", degrees[0]);
+    println!("max degree {}", degrees[degrees.len() - 1]);
 }
