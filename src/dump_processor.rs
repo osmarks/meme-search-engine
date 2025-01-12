@@ -14,6 +14,7 @@ use itertools::Itertools;
 use simsimd::SpatialSimilarity;
 use std::hash::Hasher;
 use foldhash::{HashSet, HashSetExt};
+use std::os::unix::prelude::FileExt;
 
 use diskann::vector::{scale_dot_result_f64, ProductQuantizer};
 
@@ -161,15 +162,29 @@ fn main() -> Result<()> {
     let (mut queries_index, max_query_id) = if let Some(queries_file) = args.queries {
         println!("constructing index");
         // not memory-efficient but this is small
-        let data = fs::read(queries_file).context("read queries file")?;
+        let mut file = fs::File::open(queries_file).context("read queries file")?;
+        let mut size = file.metadata()?.len();
         //let mut index = faiss::index_factory(D_EMB, "HNSW32,SQfp16", faiss::MetricType::InnerProduct)?;
-        let mut index = faiss::index_factory(D_EMB, "HNSW32,SQfp16", faiss::MetricType::InnerProduct)?;
+        let mut index = faiss::index_factory(D_EMB, "HNSW64,SQ8", faiss::MetricType::InnerProduct)?;
         //let mut index = faiss::index_factory(D_EMB, "IVF4096,SQfp16", faiss::MetricType::InnerProduct)?;
-        let unpacked = common::decode_fp16_buffer(&data);
-        index.train(&unpacked)?;
-        index.add(&unpacked)?;
+        let mut buf = vec![0; (D_EMB as usize) * (1<<18)];
+        loop {
+            if size == 0 {
+                break;
+            }
+            if size < (buf.len() as u64) {
+                buf.resize(size as usize, 0);
+            }
+            file.read_exact(&mut buf)?;
+            size -= buf.len() as u64;
+            let unpacked = common::decode_fp16_buffer(&buf);
+            if !index.is_trained() { index.train(&unpacked)?; print!("train"); }
+            index.add(&unpacked)?;
+            print!(".");
+        }
         println!("done");
-        (Some(index), unpacked.len() / D_EMB as usize)
+        let ntotal = index.ntotal();
+        (Some(index), ntotal as usize)
     } else {
         (None, 0)
     };
@@ -267,14 +282,15 @@ fn main() -> Result<()> {
                 let shard = shard as usize;
                 // this random access is almost certainly rather slow
                 // parallelize?
-                files[shard].1.seek(SeekFrom::Start(offset))?;
                 let mut buf = vec![0; len as usize];
-                files[shard].1.read_exact(&mut buf)?;
-                let s: &mut [u32] = bytemuck::cast_slice_mut(&mut *buf);
-                for within_shard_id in s.iter_mut() {
-                    *within_shard_id = shard_id_mappings[shard].1[*within_shard_id as usize];
+                files[shard].1.read_exact_at(&mut buf, offset)?;
+                let s: &[u32] = bytemuck::cast_slice(&mut *buf);
+                for within_shard_id in s.iter() {
+                    let global_id = shard_id_mappings[shard].1[*within_shard_id as usize];
+                    if !out_vertices.contains(&global_id) {
+                        out_vertices.push(global_id);
+                    }
                 }
-                out_vertices.extend(s.iter().unique());
             }
 
             Ok((out_vertices, shards))
@@ -422,7 +438,7 @@ fn main() -> Result<()> {
             let codes = quantizer.quantize_batch(&batch_embeddings);
 
             for (i, (x, _embedding)) in batch.into_iter().enumerate() {
-                let (vertices, shards) = read_out_vertices(count)?; // TODO: could parallelize this given the batching
+                let (vertices, shards) = read_out_vertices(count + i as u32)?; // TODO: could parallelize this given the batching
                 let mut entry = PackedIndexEntry {
                     id: count + i as u32,
                     vertices,

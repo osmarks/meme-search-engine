@@ -19,20 +19,6 @@ pub struct IndexGraph {
 }
 
 impl IndexGraph {
-    pub fn random_r_regular(rng: &mut Rng, n: usize, r: usize, capacity: usize) -> Self {
-        let mut graph = Vec::with_capacity(n);
-        for _ in 0..n {
-            let mut adjacency = Vec::with_capacity(capacity);
-            for _ in 0..r {
-                adjacency.push(rng.u32(0..(n as u32)));
-            }
-            graph.push(RwLock::new(adjacency));
-        }
-        IndexGraph {
-            graph
-        }
-    }
-
     pub fn empty(n: usize, capacity: usize) -> IndexGraph {
         let mut graph = Vec::with_capacity(n);
         for _ in 0..n {
@@ -57,7 +43,8 @@ pub struct IndexBuildConfig {
     pub r: usize,
     pub l: usize,
     pub maxc: usize,
-    pub alpha: i64
+    pub alpha: i64,
+    pub saturate_graph: bool
 }
 
 
@@ -79,6 +66,7 @@ pub fn medioid(vecs: &VectorList) -> u32 {
 
 // neighbours list sorted by score descending
 // TODO: this may actually be an awful datastructure
+// we could also have a heap of unvisited things, but the algorithm's stopping condition cares about visited things, and this is probably still the easiest way
 #[derive(Clone, Debug)]
 pub struct NeighbourBuffer {
     pub ids: Vec<u32>,
@@ -244,8 +232,9 @@ fn robust_prune(scratch: &mut Scratch, p: u32, neigh: &mut Vec<u32>, vecs: &Vect
     let mut candidate_index = 0;
     while neigh.len() < config.r && candidate_index < candidates.len() {
         let p_star = candidates[candidate_index].0;
+        let p_star_score = candidates[candidate_index].1;
         candidate_index += 1;
-        if p_star == p || p_star == u32::MAX {
+        if p_star == p || p_star_score == i64::MIN {
             continue;
         }
 
@@ -256,7 +245,7 @@ fn robust_prune(scratch: &mut Scratch, p: u32, neigh: &mut Vec<u32>, vecs: &Vect
         // mark remaining candidates as not-to-be-used if "not much better than" current candidate
         for i in (candidate_index+1)..candidates.len() {
             let p_prime = candidates[i].0;
-            if p_prime != u32::MAX {
+            if candidates[i].1 != i64::MIN {
                 scratch.robust_prune_scratch_buffer.push((i, p_prime));
             }
         }
@@ -268,7 +257,18 @@ fn robust_prune(scratch: &mut Scratch, p: u32, neigh: &mut Vec<u32>, vecs: &Vect
             let alpha_times_p_star_prime_score = (config.alpha * p_star_prime_score) >> 16;
 
             if alpha_times_p_star_prime_score >= p_prime_p_score {
-                candidates[ci].0 = u32::MAX;
+                candidates[ci].1 = i64::MIN;
+            }
+        }
+    }
+
+    if config.saturate_graph {
+        for &(id, _score) in candidates.iter() {
+            if neigh.len() == config.r {
+                return;
+            }
+            if !neigh.contains(&id) {
+                neigh.push(id);
             }
         }
     }
@@ -313,38 +313,7 @@ pub fn build_graph(rng: &mut Rng, graph: &mut IndexGraph, medioid: u32, vecs: &V
     });
 }
 
-// RoarGraph's AcquireNeighbours algorithm is actually almost identical to Vamana/DiskANN's RobustPrune, but with fixed α = 1.0.
-// We replace Vamana's random initialization of the graph with Neighbourhood-Aware Projection from RoarGraph - there's no way to use a large enough
-// query set that I would be confident in using *only* RoarGraph's algorithm
-pub fn project_bipartite(rng: &mut Rng, graph: &mut IndexGraph, query_knns: &Vec<Vec<u32>>, query_knns_bwd: &Vec<Vec<u32>>, config: IndexBuildConfig, vecs: &VectorList) {
-    let mut sigmas: Vec<u32> = (0..(graph.graph.len() as u32)).collect();
-    rng.shuffle(&mut sigmas);
-
-    // Iterate through graph vertices in a random order
-    let rng = Mutex::new(rng.fork());
-    sigmas.into_par_iter().for_each_init(|| (rng.lock().unwrap().fork(), Scratch::new(config)), |(rng, scratch), sigma_i| {
-        scratch.visited.clear();
-        scratch.visited_list.clear();
-        scratch.neighbour_pre_buffer.clear();
-        for &query_neighbour in query_knns[sigma_i as usize].iter() {
-            for &projected_neighbour in query_knns_bwd[query_neighbour as usize].iter() {
-                if scratch.visited.insert(projected_neighbour) {
-                    scratch.neighbour_pre_buffer.push(projected_neighbour);
-                }
-            }
-        }
-        rng.shuffle(&mut scratch.neighbour_pre_buffer);
-        scratch.neighbour_pre_buffer.truncate(config.maxc * 2);
-        for (i, &projected_neighbour) in scratch.neighbour_pre_buffer.iter().enumerate() {
-            let score = fast_dot(&vecs[sigma_i as usize], &vecs[projected_neighbour as usize], &vecs[scratch.neighbour_pre_buffer[(i + 1) % scratch.neighbour_pre_buffer.len()] as usize]);
-            scratch.visited_list.push((projected_neighbour, score));
-        }
-        let mut neighbours = graph.out_neighbours_mut(sigma_i);
-        robust_prune(scratch, sigma_i, &mut *neighbours, vecs, config);
-    })
-}
-
-pub fn augment_bipartite(rng: &mut Rng, graph: &mut IndexGraph, query_knns: Vec<Vec<u32>>, query_knns_bwd: Vec<Vec<u32>>, config: IndexBuildConfig) {
+pub fn augment_bipartite(rng: &mut Rng, graph: &mut IndexGraph, query_knns: Vec<Vec<u32>>, query_knns_bwd: Vec<Vec<u32>>, config: IndexBuildConfig, max_iters: usize) {
     let mut sigmas: Vec<u32> = (0..(graph.graph.len() as u32)).collect();
     rng.shuffle(&mut sigmas);
 
@@ -353,7 +322,7 @@ pub fn augment_bipartite(rng: &mut Rng, graph: &mut IndexGraph, query_knns: Vec<
     sigmas.into_par_iter().for_each_init(|| rng.lock().unwrap().fork(), |rng, sigma_i| {
         let mut neighbours = graph.out_neighbours_mut(sigma_i);
         let mut i = 0;
-        while neighbours.len() < config.r && i < 100 {
+        while neighbours.len() < config.r && i < max_iters {
             let query_neighbour = *rng.choice(&query_knns[sigma_i as usize]).unwrap();
             let projected_neighbour = *rng.choice(&query_knns_bwd[query_neighbour as usize]).unwrap();
             if !neighbours.contains(&projected_neighbour) {

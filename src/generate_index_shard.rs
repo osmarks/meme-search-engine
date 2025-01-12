@@ -3,7 +3,7 @@ use itertools::Itertools;
 use std::io::{BufReader, BufWriter, Write};
 use rmp_serde::decode::Error as DecodeError;
 use std::fs;
-use diskann::{augment_bipartite, build_graph, project_bipartite, random_fill_graph, vector::{dot, VectorList}, IndexBuildConfig, IndexGraph, Timer, report_degrees};
+use diskann::{augment_bipartite, build_graph, random_fill_graph, vector::{dot, VectorList}, IndexBuildConfig, IndexGraph, Timer, report_degrees, medioid};
 use half::f16;
 
 mod common;
@@ -41,10 +41,11 @@ fn main() -> Result<()> {
     }
 
     let mut config = IndexBuildConfig {
-        r: 40,
-        l: 200,
+        r: 64,
+        l: 192,
         maxc: 750,
-        alpha: 65300
+        alpha: 65200,
+        saturate_graph: false
     };
 
     let vecs = VectorList {
@@ -67,9 +68,7 @@ fn main() -> Result<()> {
 
     report_degrees(&graph);
 
-    let medioid = vecs.iter().position_max_by_key(|&v| {
-        dot(v, &centroid_fp16)
-    }).unwrap() as u32;
+    let medioid = medioid(&vecs);
 
     {
         let _timer = Timer::new("first pass");
@@ -101,7 +100,8 @@ fn main() -> Result<()> {
 
     {
         let _timer = Timer::new("augment bipartite");
-        augment_bipartite(&mut rng, &mut graph, query_knns, query_knns_bwd, config);
+        //augment_bipartite(&mut rng, &mut graph, query_knns, query_knns_bwd, config, 50);
+        //random_fill_graph(&mut rng, &mut graph, config.r);
     }
 
     let len = original_ids.len();
