@@ -4,7 +4,7 @@ use std::collections::BinaryHeap;
 use std::io::{BufReader, BufWriter, Write};
 use std::fs;
 use rmp_serde::decode::{Error as DecodeError, from_read};
-use diskann::{augment_bipartite, build_graph, project_bipartite, random_fill_graph, vector::{dot, VectorList, scale_dot_result}, IndexBuildConfig, IndexGraph, Timer, report_degrees};
+use diskann::{augment_bipartite, build_graph, project_bipartite, random_fill_graph, vector::{dot, VectorList, scale_dot_result}, IndexBuildConfig, IndexGraph, Timer, report_degrees, medioid};
 use half::f16;
 
 mod common;
@@ -101,9 +101,7 @@ fn main() -> Result<()> {
 
     report_degrees(&graph);
 
-    let medioid = vecs.iter().position_max_by_key(|&v| {
-        dot(v, &centroid_fp16)
-    }).unwrap() as u32;
+    let medioid = medioid(&vecs);
 
     {
         let _timer = Timer::new("first pass");

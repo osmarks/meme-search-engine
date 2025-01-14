@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use diskann::vector::scale_dot_result_f64;
 use serde::{Serialize, Deserialize};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::prelude::FileExt;
 use std::path::PathBuf;
 use std::fs;
 use base64::Engine;
@@ -31,15 +32,16 @@ struct CLIArguments {
     verbose: bool,
     #[argh(option, short='n', description="stop at n queries")]
     n: Option<usize>,
+    #[argh(option, short='L', description="search list size")]
+    search_list_size: Option<usize>,
     #[argh(switch, description="always use full-precision vectors (slow)")]
     disable_pq: bool
 }
 
 fn read_node(id: u32, data_file: &mut fs::File, header: &IndexHeader) -> Result<PackedIndexEntry> {
     let offset = id as usize * header.record_pad_size;
-    data_file.seek(SeekFrom::Start(offset as u64))?;
     let mut buf = vec![0; header.record_pad_size as usize];
-    data_file.read_exact(&mut buf)?;
+    data_file.read_exact_at(&mut buf, offset as u64)?;
     let len = u16::from_le_bytes(buf[0..2].try_into().unwrap()) as usize;
     Ok(bitcode::decode(&buf[2..len+2])?)
 }
@@ -117,8 +119,10 @@ fn summary_stats(ranks: &mut [usize]) {
     ranks.sort_unstable();
     let median = ranks[ranks.len() / 2] + 1;
     let harmonic_mean = ranks.iter().map(|x| 1.0 / ((x+1) as f64)).sum::<f64>() / ranks.len() as f64;
-    println!("median {} mean {} max {} min {} harmonic mean {}", median, mean, ranks[ranks.len() - 1] + 1, ranks[0] + 1, 1.0 / harmonic_mean);
+    println!("median {} mean {:.2} max {} min {} harmonic mean {:.2}", median, mean, ranks[ranks.len() - 1] + 1, ranks[0] + 1, 1.0 / harmonic_mean);
 }
+
+const K: usize = 20;
 
 fn main() -> Result<()> {
     let args: CLIArguments = argh::from_env();
@@ -150,8 +154,11 @@ fn main() -> Result<()> {
 
     println!("{} items {} dead {} shards", header.count, header.dead_count, header.shards.len());
 
-    let mut top_20_ranks_best_shard = vec![];
+    let mut top_k_ranks_best_shard = vec![];
     let mut top_rank_best_shard = vec![];
+    let mut pq_cmps = vec![];
+    let mut cmps = vec![];
+    let mut recall_total = 0;
 
     for query_vector in queries.iter() {
         let query_vector_fp32 = query_vector.iter().map(|x| x.to_f32()).collect::<Vec<f32>>();
@@ -183,25 +190,29 @@ fn main() -> Result<()> {
             println!("brute force: {} {} {} {:?}", id, distance, url, shards);
         }*/
 
-        let mut top_ranks = vec![usize::MAX; 20];
+        let mut top_ranks = vec![usize::MAX; K];
 
         for shard in 0..header.shards.len() {
             let selected_start = header.shards[shard].1;
 
             let mut scratch = Scratch {
                 visited: HashSet::new(),
-                neighbour_buffer: NeighbourBuffer::new(300),
+                neighbour_buffer: NeighbourBuffer::new(args.search_list_size.unwrap_or(1000)),
                 neighbour_pre_buffer: Vec::new(),
                 visited_list: Vec::new()
             };
 
             //let query_vector = diskann::vector::quantize(&query_vector, &header.quantizer, &mut rng);
-            let cmps = greedy_search(&mut scratch, selected_start, &query_vector, &query_preprocessed, IndexRef {
+            let cmps_result = greedy_search(&mut scratch, selected_start, &query_vector, &query_preprocessed, IndexRef {
                 data_file: &mut data_file,
                 header: &header,
                 pq_codes: &pq_codes,
                 pq_code_size: header.quantizer.n_dims / header.quantizer.n_dims_per_code,
             }, args.disable_pq)?;
+
+            // slightly dubious because this is across shards
+            pq_cmps.push(cmps_result.1);
+            cmps.push(cmps_result.0);
 
             if args.verbose {
                 println!("index scan {}: {:?} cmps", shard, cmps);
@@ -209,29 +220,38 @@ fn main() -> Result<()> {
 
             scratch.visited_list.sort_by_key(|x| -x.1);
             for (i, (id, distance, url, shards)) in scratch.visited_list.iter().take(20).enumerate() {
-                if args.verbose {
-                    println!("index scan: {} {} {} {:?}", id, distance, url, shards);
-                };
                 let found_id = match matches.binary_search(&(*id, 0)) {
                     Ok(pos) => pos,
                     Err(pos) => pos
                 };
                 if args.verbose {
-                    println!("rank {}", matches[found_id].1);
+                    println!("index scan: {} {} {} {:?}; rank {}", id, distance, url, shards, matches[found_id].1 + 1);
                 };
                 top_ranks[i] = std::cmp::min(top_ranks[i], matches[found_id].1);
             }
             if args.verbose { println!("") }
         }
 
+        // results list is always correctly sorted
+        for &rank in top_ranks.iter() {
+            if rank < K {
+                recall_total += 1;
+            }
+        }
+
         top_rank_best_shard.push(top_ranks[0]);
-        top_20_ranks_best_shard.extend(top_ranks);
+        top_k_ranks_best_shard.extend(top_ranks);
     }
 
     println!("ranks of top 20:");
-    summary_stats(&mut top_20_ranks_best_shard);
+    summary_stats(&mut top_k_ranks_best_shard);
     println!("ranks of top 1:");
     summary_stats(&mut top_rank_best_shard);
+    println!("pq comparisons:");
+    summary_stats(&mut pq_cmps);
+    println!("comparisons:");
+    summary_stats(&mut cmps);
+    println!("recall@{}: {}", K, recall_total as f64 / (K * queries.len()) as f64);
 
     Ok(())
 }

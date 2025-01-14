@@ -52,7 +52,14 @@ fn main() -> Result<()> {
     let vecs = {
         let _timer = Timer::new("loaded vectors");
 
-        &load_file("query.bin", Some(D_EMB * n))?
+        &load_file("real.bin", None)?
+    };
+
+    println!("{} vectors", vecs.len());
+
+    let queries = {
+        let _timer = Timer::new("loaded queries");
+        &load_file("../query5.bin", None)?
     };
 
     let (graph, medioid) = {
@@ -63,9 +70,12 @@ fn main() -> Result<()> {
             l: 192,
             maxc: 750,
             alpha: 65200,
+            saturate_graph: false
         };
 
-        let mut graph = IndexGraph::random_r_regular(&mut rng, vecs.len(), config.r, config.r_cap);
+        let mut graph = IndexGraph::empty(vecs.len(), config.r);
+
+        random_fill_graph(&mut rng, &mut graph, config.r);
 
         let medioid = medioid(&vecs);
 
@@ -92,9 +102,10 @@ fn main() -> Result<()> {
 
     let mut config = IndexBuildConfig {
         r: 64,
-        l: 50,
+        l: 200,
         alpha: 65536,
         maxc: 0,
+        saturate_graph: false
     };
 
     let mut scratch = Scratch::new(config);
@@ -112,8 +123,8 @@ fn main() -> Result<()> {
 
     let end = time.elapsed();
 
-    println!("recall@1: {} ({}/{})", recall as f32 / n as f32, recall, n);
-    println!("cmps: {} ({}/{})", cmps_ctr as f32 / n as f32, cmps_ctr, n);
+    println!("recall@1: {} ({}/{})", recall as f32 / vecs.len() as f32, recall, vecs.len());
+    println!("cmps: {} ({}/{})", cmps_ctr as f32 / vecs.len() as f32, cmps_ctr, vecs.len());
     println!("median comparisons: {}", cmps[cmps.len() / 2]);
     //println!("brute force recall@1: {} ({}/{})", brute_force_recall as f32 / brute_force_queries as f32, brute_force_recall, brute_force_queries);
     println!("{} QPS", n as f32 / end.as_secs_f32());

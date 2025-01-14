@@ -176,7 +176,8 @@ pub mod index_config {
         r: 40,
         l: 200,
         maxc: 900,
-        alpha: 65200
+        alpha: 65200,
+        saturate_graph: false
     };
 
     pub const PROJECTION_CUT_POINT: usize = 3;
