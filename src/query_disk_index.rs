@@ -32,6 +32,8 @@ struct CLIArguments {
     verbose: bool,
     #[argh(option, short='n', description="stop at n queries")]
     n: Option<usize>,
+    #[argh(option, short='L', description="search list size")]
+    search_list_size: Option<usize>,
     #[argh(switch, description="always use full-precision vectors (slow)")]
     disable_pq: bool
 }
@@ -195,7 +197,7 @@ fn main() -> Result<()> {
 
             let mut scratch = Scratch {
                 visited: HashSet::new(),
-                neighbour_buffer: NeighbourBuffer::new(1000),
+                neighbour_buffer: NeighbourBuffer::new(args.search_list_size.unwrap_or(1000)),
                 neighbour_pre_buffer: Vec::new(),
                 visited_list: Vec::new()
             };
