@@ -360,7 +360,7 @@ pub fn robust_stitch(rng: &mut Rng, graph: &mut IndexGraph, vecs: &VectorList, c
             let mut in_neighbour_out_edges = graph.out_neighbours_mut(in_neighbour);
             let mut added = 0;
             for (neigh, _score) in candidates {
-                if added >= config.max_add_per_stitch_iter {
+                if added >= config.max_add_per_stitch_iter || in_neighbour_out_edges.len() >= config.r {
                     break;
                 }
                 if in_neighbour_out_edges.contains(&neigh) {
