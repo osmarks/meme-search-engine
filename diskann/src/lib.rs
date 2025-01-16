@@ -350,7 +350,6 @@ pub fn robust_stitch(rng: &mut Rng, graph: &mut IndexGraph, vecs: &VectorList, c
         // The OOD-DiskANN paper itself seems to fill *all* the spare space at once with (out-neighbours of) the first query which is encountered, which feels like an odd choice.
         // We have a switch for that instead.
         let query_out_neighbours = graph.out_neighbours(query_i);
-        println!("{} has {} in {} out", query_i, in_edges[(query_i - config.query_breakpoint) as usize].len(), query_out_neighbours.len());
         for &in_neighbour in in_edges[(query_i - config.query_breakpoint) as usize].iter() {
             let mut candidates = Vec::with_capacity(query_out_neighbours.len());
             for (i, &neigh) in query_out_neighbours.iter().enumerate() {
@@ -370,7 +369,6 @@ pub fn robust_stitch(rng: &mut Rng, graph: &mut IndexGraph, vecs: &VectorList, c
                 in_neighbour_out_edges.push(neigh);
                 added += 1;
             }
-            println!("wrote {} out to {}", added, in_neighbour);
         }
     });
 }
