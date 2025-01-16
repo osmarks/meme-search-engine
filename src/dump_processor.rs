@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde::{Serialize, Deserialize};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write, BufWriter};
+use std::io::{BufReader, Write, BufWriter};
 use std::path::PathBuf;
 use rmp_serde::decode::Error as DecodeError;
 use std::fs;
@@ -8,7 +8,6 @@ use base64::Engine;
 use argh::FromArgs;
 use chrono::{TimeZone, Utc, DateTime};
 use std::collections::VecDeque;
-use faiss::Index;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use itertools::Itertools;
 use simsimd::SpatialSimilarity;
@@ -47,8 +46,6 @@ struct CLIArguments {
     centroids: Option<String>,
     #[argh(option, short='S', description="index shard directory")]
     shards_dir: Option<String>,
-    #[argh(option, short='Q', description="query vectors file")]
-    queries: Option<String>,
     #[argh(option, short='d', description="random seed")]
     seed: Option<u64>,
     #[argh(option, short='i', description="index output directory")]
@@ -62,7 +59,9 @@ struct CLIArguments {
     #[argh(option, short='q', description="product quantization codec path")]
     pq_codec: Option<String>,
     #[argh(switch, short='j', description="JSON output")]
-    json: bool
+    json: bool,
+    #[argh(option, short='f', description="k-means balance fudge factor", default="0.2")]
+    balance_fudge: f64,
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -125,9 +124,19 @@ const SHARD_SPILL: usize = 2;
 const RECORD_PAD_SIZE: usize = 4096; // NVMe disk sector size
 const D_EMB: u32 = 1152;
 const EMPTY_LOOKUP: (u32, u64, u32) = (u32::MAX, 0, 0);
-const KNN_K: usize = 30;
-const BALANCE_WEIGHT: f64 = 0.2;
-const BATCH_SIZE: usize = 128;
+const BATCH_SIZE: usize = 1024;
+
+#[derive(Clone, Serialize, Debug)]
+pub struct JsonEntry<'a> {
+    pub url: &'a str,
+    pub id: &'a str,
+    pub title: &'a str,
+    pub subreddit: &'a str,
+    pub author: &'a str,
+    pub timestamp: u64,
+    pub embedding: &'a [f32],
+    pub metadata: common::OriginalImageMetadata
+}
 
 fn main() -> Result<()> {
     let args: CLIArguments = argh::from_env();
@@ -158,37 +167,6 @@ fn main() -> Result<()> {
         None
     };
 
-    // construct FAISS index over query vectors for kNNs
-    let (mut queries_index, max_query_id) = if let Some(queries_file) = args.queries {
-        println!("constructing index");
-        // not memory-efficient but this is small
-        let mut file = fs::File::open(queries_file).context("read queries file")?;
-        let mut size = file.metadata()?.len();
-        //let mut index = faiss::index_factory(D_EMB, "HNSW32,SQfp16", faiss::MetricType::InnerProduct)?;
-        let mut index = faiss::index_factory(D_EMB, "HNSW64,SQ8", faiss::MetricType::InnerProduct)?;
-        //let mut index = faiss::index_factory(D_EMB, "IVF4096,SQfp16", faiss::MetricType::InnerProduct)?;
-        let mut buf = vec![0; (D_EMB as usize) * (1<<18)];
-        loop {
-            if size == 0 {
-                break;
-            }
-            if size < (buf.len() as u64) {
-                buf.resize(size as usize, 0);
-            }
-            file.read_exact(&mut buf)?;
-            size -= buf.len() as u64;
-            let unpacked = common::decode_fp16_buffer(&buf);
-            if !index.is_trained() { index.train(&unpacked)?; print!("train"); }
-            index.add(&unpacked)?;
-            print!(".");
-        }
-        println!("done");
-        let ntotal = index.ntotal();
-        (Some(index), ntotal as usize)
-    } else {
-        (None, 0)
-    };
-
     // if sufficient config to split index exists, set up output files
     let mut shards_out = if let (Some(shards_dir), Some(centroids)) = (&args.shards_dir, &args.centroids) {
         let mut shards = Vec::new();
@@ -202,9 +180,11 @@ fn main() -> Result<()> {
         for i in 0..(centroids_data.len() / (D_EMB as usize)) {
             let centroid = centroids_data[i * (D_EMB as usize)..(i + 1) * (D_EMB as usize)].to_vec();
             let mut file = fs::File::create(PathBuf::from(shards_dir).join(format!("{}.shard.msgpack", i))).context("create shard file")?;
-            rmp_serde::encode::write(&mut file, &ShardInputHeader { id: i as u32, centroid: centroid.clone(), max_query_id })?;
+            rmp_serde::encode::write(&mut file, &ShardInputHeader { id: i as u32, centroid: centroid.clone() })?;
             shards.push((centroid, file, 0, i));
         }
+
+        println!("splitting into {} shards", shards.len());
 
         Some(shards)
     } else {
@@ -376,6 +356,21 @@ fn main() -> Result<()> {
         if args.print_embeddings {
             println!("https://mse.osmarks.net/?e={}", base64::engine::general_purpose::URL_SAFE.encode(&x.embedding));
         }
+        // this is not a very compact format, but I am lazy and this will never be a performance bottleneck
+        if args.json {
+            let entry = JsonEntry {
+                url: &x.url,
+                id: &x.id,
+                title: &x.title,
+                subreddit: &x.subreddit,
+                author: &x.author,
+                timestamp: x.timestamp,
+                embedding: &embedding,
+                metadata: x.metadata.clone()
+            };
+            let data = serde_json::to_string(&entry).unwrap();
+            println!("{}", data);
+        }
 
         Some((x, embedding))
     };
@@ -395,26 +390,17 @@ fn main() -> Result<()> {
         }
 
         if let Some(shards) = &mut shards_out {
-            let mut knn_query = vec![];
-            for (_, embedding) in batch.iter() {
-                knn_query.extend(embedding);
-            }
-
-            let index = queries_index.as_mut().context("need queries")?;
-            let knn_result = index.search(&knn_query, KNN_K)?;
-
             for (i, (x, embedding)) in batch.iter().enumerate() {
                 // closest matches first
                 shards.sort_by_cached_key(|&(ref centroid, _, shard_count, _shard_index)| {
                     let mut dot = SpatialSimilarity::dot(&centroid, &embedding).unwrap();
-                    dot -= BALANCE_WEIGHT * (shard_count as f64 / bal_count as f64);
+                    dot -= args.balance_fudge * (shard_count as f64 / bal_count as f64);
                     -scale_dot_result_f64(dot)
                 });
 
                 let entry = ShardedRecord {
                     id: count + i as u32,
-                    vector: x.embedding.clone(),
-                    query_knns: knn_result.labels[i * KNN_K..(i + 1)*KNN_K].into_iter().map(|x| x.get().unwrap() as u32).collect()
+                    vector: x.embedding.clone()
                 };
                 let data = rmp_serde::to_vec(&entry)?;
                 for (_, file, shard_count, _shard_index) in shards[0..SHARD_SPILL].iter_mut() {

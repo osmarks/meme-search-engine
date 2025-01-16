@@ -125,16 +125,14 @@ pub struct ProcessedEntry {
 #[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct ShardInputHeader {
     pub id: u32,
-    pub centroid: Vec<f32>,
-    pub max_query_id: usize
+    pub centroid: Vec<f32>
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct ShardedRecord {
     pub id: u32,
     #[serde(with="serde_bytes")]
-    pub vector: Vec<u8>, // FP16
-    pub query_knns: Vec<u32>
+    pub vector: Vec<u8> // FP16
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]

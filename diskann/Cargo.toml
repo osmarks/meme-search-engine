@@ -10,7 +10,6 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 simsimd = "6"
 foldhash = "0.1"
-bitvec = "1"
 tqdm = "0.7"
 anyhow = "1"
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }

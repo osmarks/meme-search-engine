@@ -3,7 +3,7 @@
 
 extern crate test;
 
-use foldhash::{HashSet, HashMap, HashMapExt, HashSetExt};
+use foldhash::{HashSet, HashSetExt};
 use fastrand::Rng;
 use rayon::prelude::*;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, Mutex};
@@ -44,7 +44,10 @@ pub struct IndexBuildConfig {
     pub l: usize,
     pub maxc: usize,
     pub alpha: i64,
-    pub saturate_graph: bool
+    pub saturate_graph: bool,
+    pub query_breakpoint: u32, // above this nodes are queries and not base vectors
+    pub max_add_per_stitch_iter: usize,
+    pub query_alpha: i64
 }
 
 
@@ -160,7 +163,7 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    pub fn new(IndexBuildConfig { l, r, maxc, .. }: IndexBuildConfig) -> Self {
+    pub fn new(IndexBuildConfig { l, r, .. }: IndexBuildConfig) -> Self {
         Scratch {
             visited: HashSet::with_capacity(l * 8),
             neighbour_buffer: NeighbourBuffer::new(l),
@@ -177,7 +180,7 @@ pub struct GreedySearchCounters {
 
 // Algorithm 1 from the DiskANN paper
 // We support the dot product metric only, so we want to keep things with the HIGHEST dot product
-pub fn greedy_search(scratch: &mut Scratch, start: u32, query: VectorRef, vecs: &VectorList, graph: &IndexGraph, config: IndexBuildConfig) -> GreedySearchCounters {
+pub fn greedy_search(scratch: &mut Scratch, start: u32, base_vectors_only: bool, query: VectorRef, vecs: &VectorList, graph: &IndexGraph, config: IndexBuildConfig) -> GreedySearchCounters {
     scratch.visited.clear();
     scratch.neighbour_buffer.clear();
     scratch.visited_list.clear();
@@ -190,7 +193,8 @@ pub fn greedy_search(scratch: &mut Scratch, start: u32, query: VectorRef, vecs: 
     while let Some(pt) = scratch.neighbour_buffer.next_unvisited() {
         scratch.neighbour_pre_buffer.clear();
         for &neighbour in graph.out_neighbours(pt).iter() {
-            if scratch.visited.insert(neighbour) {
+            let neighbour_is_query = neighbour >= config.query_breakpoint; // OOD-DiskANN page 4: if we are searching for a query, only consider results in base vectors
+            if scratch.visited.insert(neighbour) && !(base_vectors_only && neighbour_is_query) {
                 scratch.neighbour_pre_buffer.push(neighbour);
             }
         }
@@ -208,7 +212,7 @@ pub fn greedy_search(scratch: &mut Scratch, start: u32, query: VectorRef, vecs: 
 
 type CandidateList = Vec<(u32, i64)>;
 
-fn merge_existing_neighbours(candidates: &mut CandidateList, point: u32, neigh: &[u32], vecs: &VectorList, config: IndexBuildConfig) {
+fn merge_existing_neighbours(candidates: &mut CandidateList, point: u32, neigh: &[u32], vecs: &VectorList) {
     let p_vec = &vecs[point as usize];
     for (i, &n) in neigh.iter().enumerate() {
         let dot = fast_dot(p_vec, &vecs[n as usize], &vecs[neigh[(i + 1) % neigh.len() as usize] as usize]);
@@ -218,7 +222,7 @@ fn merge_existing_neighbours(candidates: &mut CandidateList, point: u32, neigh: 
 
 // "Robust prune" algorithm, kind of
 // The algorithm in the paper does not actually match the code as implemented in microsoft/DiskANN
-// and that's slightly different from the one in ParlayANN for no reason
+// and that's slightly different from the one in ParlayANN for no clear reason
 // This is closer to ParlayANN
 fn robust_prune(scratch: &mut Scratch, p: u32, neigh: &mut Vec<u32>, vecs: &VectorList, config: IndexBuildConfig) {
     neigh.clear();
@@ -254,7 +258,12 @@ fn robust_prune(scratch: &mut Scratch, p: u32, neigh: &mut Vec<u32>, vecs: &Vect
             let next_vec = &vecs[scratch.robust_prune_scratch_buffer[(i + 1) % scratch.robust_prune_scratch_buffer.len()].0 as usize];
             let p_star_prime_score = fast_dot(&vecs[p_prime as usize], &vecs[p_star as usize], next_vec);
             let p_prime_p_score = candidates[ci].1;
-            let alpha_times_p_star_prime_score = (config.alpha * p_star_prime_score) >> 16;
+            let con_alpha = if p_prime >= config.query_breakpoint {
+                config.query_alpha
+            } else {
+                config.alpha
+            };
+            let alpha_times_p_star_prime_score = (con_alpha * p_star_prime_score) >> 16;
 
             if alpha_times_p_star_prime_score >= p_prime_p_score {
                 candidates[ci].1 = i64::MIN;
@@ -262,7 +271,8 @@ fn robust_prune(scratch: &mut Scratch, p: u32, neigh: &mut Vec<u32>, vecs: &Vect
         }
     }
 
-    if config.saturate_graph {
+    // saturate graph on for query points - otherwise they get no neighbours, more or less
+    if config.saturate_graph || p >= config.query_breakpoint {
         for &(id, _score) in candidates.iter() {
             if neigh.len() == config.r {
                 return;
@@ -276,21 +286,21 @@ fn robust_prune(scratch: &mut Scratch, p: u32, neigh: &mut Vec<u32>, vecs: &Vect
 
 pub fn build_graph(rng: &mut Rng, graph: &mut IndexGraph, medioid: u32, vecs: &VectorList, config: IndexBuildConfig) {
     assert!(vecs.len() < u32::MAX as usize);
+    assert_eq!(vecs.len(), graph.graph.len());
 
     let mut sigmas: Vec<u32> = (0..(vecs.len() as u32)).collect();
     rng.shuffle(&mut sigmas);
 
-    let rng = Mutex::new(rng.fork());
-
     //let scratch = &mut Scratch::new(config);
     //let mut rng = rng.lock().unwrap();
-    sigmas.into_par_iter().for_each_init(|| (Scratch::new(config), rng.lock().unwrap().fork()), |(scratch, rng), sigma_i| {
+    sigmas.into_par_iter().for_each_init(|| Scratch::new(config), |scratch, sigma_i| {
     //sigmas.into_iter().for_each(|sigma_i| {
-        greedy_search(scratch, medioid, &vecs[sigma_i as usize], vecs, &graph, config);
+        let is_query = sigma_i >= config.query_breakpoint;
+        greedy_search(scratch, medioid, is_query, &vecs[sigma_i as usize], vecs, &graph, config);
 
         {
             let n = graph.out_neighbours(sigma_i);
-            merge_existing_neighbours(&mut scratch.visited_list, sigma_i, &*n, vecs, config);
+            merge_existing_neighbours(&mut scratch.visited_list, sigma_i, &*n, vecs);
         }
 
         {
@@ -303,8 +313,8 @@ pub fn build_graph(rng: &mut Rng, graph: &mut IndexGraph, medioid: u32, vecs: &V
             let mut neighbour_neighbours = graph.out_neighbours_mut(neighbour);
             if neighbour_neighbours.len() == config.r {
                 scratch.visited_list.clear();
-                merge_existing_neighbours(&mut scratch.visited_list, neighbour, &neighbour_neighbours, vecs, config);
-                merge_existing_neighbours(&mut scratch.visited_list, neighbour, &vec![sigma_i], vecs, config);
+                merge_existing_neighbours(&mut scratch.visited_list, neighbour, &neighbour_neighbours, vecs);
+                merge_existing_neighbours(&mut scratch.visited_list, neighbour, &vec![sigma_i], vecs);
                 robust_prune(scratch, neighbour, &mut neighbour_neighbours, vecs, config);
             } else if !neighbour_neighbours.contains(&sigma_i) && neighbour_neighbours.len() < config.r {
                 neighbour_neighbours.push(sigma_i);
@@ -313,24 +323,56 @@ pub fn build_graph(rng: &mut Rng, graph: &mut IndexGraph, medioid: u32, vecs: &V
     });
 }
 
-pub fn augment_bipartite(rng: &mut Rng, graph: &mut IndexGraph, query_knns: Vec<Vec<u32>>, query_knns_bwd: Vec<Vec<u32>>, config: IndexBuildConfig, max_iters: usize) {
-    let mut sigmas: Vec<u32> = (0..(graph.graph.len() as u32)).collect();
-    rng.shuffle(&mut sigmas);
+pub fn robust_stitch(rng: &mut Rng, graph: &mut IndexGraph, vecs: &VectorList, config: IndexBuildConfig) {
+    let n_queries = graph.graph.len() as u32 - config.query_breakpoint;
+    let mut in_edges = Vec::with_capacity(n_queries as usize);
+    for _i in 0..(n_queries as usize) {
+        in_edges.push(Vec::with_capacity(config.r as usize));
+    }
 
-    // Iterate through graph vertices in a random order
-    let rng = Mutex::new(rng.fork());
-    sigmas.into_par_iter().for_each_init(|| rng.lock().unwrap().fork(), |rng, sigma_i| {
-        let mut neighbours = graph.out_neighbours_mut(sigma_i);
-        let mut i = 0;
-        while neighbours.len() < config.r && i < max_iters {
-            let query_neighbour = *rng.choice(&query_knns[sigma_i as usize]).unwrap();
-            let projected_neighbour = *rng.choice(&query_knns_bwd[query_neighbour as usize]).unwrap();
-            if !neighbours.contains(&projected_neighbour) {
-                neighbours.push(projected_neighbour);
+    let mut queries_order = (config.query_breakpoint..(graph.graph.len() as u32)).collect::<Vec<u32>>();
+    rng.shuffle(&mut queries_order);
+
+    for base_i in 0..config.query_breakpoint {
+        let mut out_neighbours = graph.out_neighbours_mut(base_i);
+        // store out-edges (to queries) from each base data node with corresponding query node and drop out-edges to queries
+        out_neighbours.retain(|&out_neighbour_out_edge| {
+            let is_query = out_neighbour_out_edge >= config.query_breakpoint;
+            if is_query {
+                in_edges[(out_neighbour_out_edge - config.query_breakpoint) as usize].push(base_i);
             }
-            i += 1;
+            !is_query
+        });
+    }
+
+    queries_order.into_par_iter().for_each(|query_i| {
+        // For each query, fill spare space at in-neighbours with query's out-neighbours
+        // The OOD-DiskANN paper itself seems to fill *all* the spare space at once with (out-neighbours of) the first query which is encountered, which feels like an odd choice.
+        // We have a switch for that instead.
+        let query_out_neighbours = graph.out_neighbours(query_i);
+        println!("{} has {} in {} out", query_i, in_edges[(query_i - config.query_breakpoint) as usize].len(), query_out_neighbours.len());
+        for &in_neighbour in in_edges[(query_i - config.query_breakpoint) as usize].iter() {
+            let mut candidates = Vec::with_capacity(query_out_neighbours.len());
+            for (i, &neigh) in query_out_neighbours.iter().enumerate() {
+                let score = fast_dot(&vecs[in_neighbour as usize], &vecs[neigh as usize], &vecs[query_out_neighbours[(i + 1) % query_out_neighbours.len()] as usize]);
+                candidates.push((neigh, score));
+            }
+            candidates.sort_unstable_by_key(|(_neigh, score)| -*score);
+            let mut in_neighbour_out_edges = graph.out_neighbours_mut(in_neighbour);
+            let mut added = 0;
+            for (neigh, _score) in candidates {
+                if added >= config.max_add_per_stitch_iter {
+                    break;
+                }
+                if in_neighbour_out_edges.contains(&neigh) {
+                    continue;
+                }
+                in_neighbour_out_edges.push(neigh);
+                added += 1;
+            }
+            println!("wrote {} out to {}", added, in_neighbour);
         }
-    })
+    });
 }
 
 pub fn random_fill_graph(rng: &mut Rng, graph: &mut IndexGraph, r: usize) {
