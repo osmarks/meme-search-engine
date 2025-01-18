@@ -1,27 +1,30 @@
 <style lang="sass">
+    @use 'common' as *
+    @use 'sass:color'
+
     \:global(*)
         box-sizing: border-box
 
     \:global(html)
         scrollbar-color: black lightgray
-            
+
     \:global(body)
-        font-family: "Fira Sans", "Noto Sans", "Segoe UI", Verdana, sans-serif
+        font-family: "Iosevka", "Shure Tech Mono", "IBM Plex Mono", monospace // TODO import iosevka
         font-weight: 300
         overflow-anchor: none
-        //margin: 0
-        //min-height: 100vh
+        margin: 0
 
     \:global(strong)
         font-weight: bold
 
     @mixin header
-        border-bottom: 1px solid gray
+        border-bottom: 1px solid white
         margin: 0
         margin-bottom: 0.5em
         font-weight: 500
-        //a
-            //color: inherit
+
+    h1
+        text-transform: uppercase
 
     \:global(h1)
         @include header
@@ -40,14 +43,15 @@
         padding: 0
         padding-left: 1em
 
-    input, button, select
+    \:global(input), :\global(button), :\global(select)
         border-radius: 0
         border: 1px solid gray
         padding: 0.5em
+        font-family: inherit
 
     .controls
         input[type=search]
-            width: 80%
+            width: 70%
         .ctrlbar
             > *
                 margin: 0 -1px
@@ -63,117 +67,242 @@
         .sliders-ctrl
             width: 5em
 
-    .result
-        border: 1px solid gray
-        *
-            display: block
-    .result img, .result video
-        width: 100%
+    .enable-advanced-mode
+        position: fixed
+        top: 0.2em
+        right: 0.2em
+        font-size: 1.3em
+
+    nav
+        background: $palette-secondary
+        display: flex
+        justify-content: space-between
+        padding: 1em
+
+    .friendly
+        h1
+            border: none
+            padding-top: 1em
+
+        input[type=search]
+            width: 100%
+            margin: 0
+            padding: 0.5em
+            font-size: 1.5em
+            border-radius: 6px
+
+        .center
+            margin-left: auto
+            margin-right: auto
+            max-width: 40em
+
+        .description
+            opacity: 0.8
+            margin-bottom: 1em
+            font-weight: bold
+
+        button
+            margin-left: 0.5em
+            margin-right: 0.5em
+            padding: 0.5em
+            background: #9a0eea
+            border-radius: 10px
+            font-size: 1.5em
+            color: white
+
+        .header
+            padding-bottom: 2em
+
+    .header
+        padding-left: 1em
+        padding-right: 1em
+        padding-top: 0.5em
+        padding-bottom: 0.5em
+        background: $palette-primary
+        color: white
+
+        p
+            font-weight: bold
+
+    .results
+        padding-left: 1em
+        padding-right: 1em
+
+    @media (prefers-color-scheme: dark)
+        \:global(body)
+            background-color: black
+            color: white
+
+        \:global(input), :\global(button), :\global(select)
+            border-radius: 0
+            border: 1px solid gray
+            padding: 0.5em
+            font-family: inherit
+            background: #222
+            color: white
+
+    .logo
+        height: 1em
+        vertical-align: middle
+        margin-bottom: 6px
 </style>
 
-<h1>Meme Search Engine</h1>
-{#if config.n_total}
-    <p>{config.n_total} items indexed.</p>
-{/if}
-<details>
-    <summary>Usage tips</summary>
-    <ul>
-        <li>This uses CLIP-like image/text embedding models. In general, search by thinking of what caption your desired image might be given by random people on the internet.</li>
-        <li>The model can read text, but not all of it.</li>
-        <li>In certain circumstances, it may be useful to postfix your query with "meme".</li>
-        <li>Capitalization is ignored.</li>
-        <li>Only English is supported. Other languages might work slightly.</li>
-        <li>Sliders are generated from PCA on the index. The human-readable labels are approximate.</li>
-        <li>Want your own deployment? Use the open-source code on <a href="https://github.com/osmarks/meme-search-engine/">GitHub.</a>.</li>
-    </ul>
-</details>
-<div class="controls">
-    <ul>
-        {#each queryTerms as term}
-            <li>
-                <button on:click={removeTerm(term)}>Remove</button>
-                <select bind:value={term.sign}>
-                    <option>+</option>
-                    <option>-</option>
-                </select>
-                <input type="range" min="0" max="2" bind:value={term.weight} step="0.01">
-                {#if term.type === "image"}
-                    <span>{term.file.name}</span>
-                {:else if term.type === "text"}
-                    <input type="search" use:focusEl on:keydown={handleKey} bind:value={term.text} />
-                {/if}
-                {#if term.type === "embedding"}
-                    <span>[embedding loaded from URL]</span>
-                {/if}
-                {#if term.type === "predefined_embedding"}
-                    <span>{term.sign === "-" ? invertEmbeddingDesc(term.predefinedEmbedding) : term.predefinedEmbedding}</span>
-                {/if}
-            </li>
-        {/each}
-    </ul>
-    <div class="ctrlbar">
-        <input type="search" placeholder="Text Query" on:keydown={handleKey} on:focus={newTextQuery}>
-        <button on:click={pickFile}>Image Query</button>
-        <select bind:value={predefinedEmbeddingName} on:change={setPredefinedEmbedding} class="sliders-ctrl">
-            <option>Sliders</option>
-            {#each config.predefined_embedding_names ?? [] as name}
-                <option>{name}</option>
-            {/each}
-        </select>
-        <button on:click={runSearch} style="margin-left: auto">Search</button>
+<nav>
+    <div class="left">
+        <NavItem page="search">Search</NavItem>
     </div>
-</div>
+    <div class="right">
+        <NavItem page="advanced">Advanced</NavItem>
+        <NavItem page="about">About</NavItem>
+        <NavItem page="refine">Refine</NavItem>
+    </div>
+</nav>
 
-{#if error}
-    <div>{error}</div>
-{/if}
-{#if resultPromise}
-    <Loading />
-{/if}
-{#if results}
-    {#if displayedResults.length === 0}
-        No results. Wait for index rebuild.
-    {/if}
-    <Masonry bind:refreshLayout={refreshLayout} colWidth="minmax(Min(20em, 100%), 1fr)" items={displayedResults}>
-        {#each displayedResults as result}
-            {#key `${queryCounter}${result.file}`}
-                <div class="result" style={aspectRatio(result)}>
-                    <a href={util.getURL(result)}>
-                        {#if util.hasFormat(results, result, "VIDEO")}
-                            <video controls poster={util.hasFormat(results, result, "jpegh") ? util.thumbnailURL(results, result, "jpegh") : null} preload="metadata" on:loadstart={updateCounter} on:loadedmetadata={redrawGrid} on:loadeddata={redrawGrid}>
-                                <source src={util.getURL(result)} />
-                            </video>
-                        {:else}
-                            <picture>
-                                {#if util.hasFormat(results, result, "avifl")}
-                                    <source srcset={util.thumbnailURL(results, result, "avifl") + (util.hasFormat(results, result, "avifh") ? ", " + util.thumbnailURL(results, result, "avifh") + " 2x" : "")} type="image/avif" />
-                                {/if}
-                                {#if util.hasFormat(results, result, "jpegl")}
-                                    <source srcset={util.thumbnailURL(results, result, "jpegl") + (util.hasFormat(results, result, "jpegh") ? ", " + util.thumbnailURL(results, result, "jpegh") + " 2x" : "")} type="image/jpeg" />
-                                {/if}
-                                <img src={util.getURL(result)} on:load={updateCounter} on:error={updateCounter} alt={result[1]}>
-                            </picture>
+{#if page === "search" || page === "advanced"}
+    <div class={"container" + (friendlyMode ? " friendly" : " advanced")}>
+    <div class="header">
+        {#if friendlyMode}
+        <div>
+            <div class="center">
+                <h1 class="logo-container"><img class="logo" src="./logo.png"> {util.hardConfig.name}</h1>
+                <div class="description">{util.hardConfig.description}</div>
+                <input type="search" placeholder="🔎 Search Memes" on:keydown={handleKey} autofocus bind:value={friendlyModeQuery} />
+            </div>
+        </div>
+        {:else}
+        <h1>{util.hardConfig.name}</h1>
+        <p>
+        {#if config.n_total}
+            {config.n_total} items indexed.
+        {/if}
+        </p>
+        <div class="controls">
+            <ul>
+                {#each queryTerms as term}
+                    <li>
+                        <button on:click={removeTerm(term)}>Remove</button>
+                        <select bind:value={term.sign}>
+                            <option>+</option>
+                            <option>-</option>
+                        </select>
+                        <input type="range" min="0" max="2" bind:value={term.weight} step="0.01">
+                        {#if term.type === "image"}
+                            <span>{term.file.name}</span>
+                        {:else if term.type === "text"}
+                            <input type="search" use:focusEl on:keydown={handleKey} bind:value={term.text} />
                         {/if}
-                    </a>
-                </div>
-            {/key}
-        {/each}
-    </Masonry>
+                        {#if term.type === "embedding"}
+                            <span>[embedding loaded from URL]</span>
+                        {/if}
+                        {#if term.type === "predefined_embedding"}
+                            <span>{term.sign === "-" ? invertEmbeddingDesc(term.predefinedEmbedding) : term.predefinedEmbedding}</span>
+                        {/if}
+                    </li>
+                {/each}
+            </ul>
+            <div class="ctrlbar">
+                <input type="search" placeholder="Text Query" on:keydown={handleKey} on:focus={newTextQuery}>
+                <button on:click={pickFile}>Image Query</button>
+                <select bind:value={predefinedEmbeddingName} on:change={setPredefinedEmbedding} class="sliders-ctrl">
+                    <option>Sliders</option>
+                    {#each config.predefined_embedding_names ?? [] as name}
+                        <option>{name}</option>
+                    {/each}
+                </select>
+                <button on:click={runSearch} style="margin-left: auto">Search</button>
+            </div>
+        </div>
+        {/if}
+    </div>
+
+    <div class="results"><SearchResults {resultPromise} {results} {error} {friendlyMode} {queryCounter} /></div>
+    </div>
 {/if}
 
-<svelte:window on:resize={redrawGrid} on:scroll={handleScroll}></svelte:window>
+{#if page === "about"}
+    <About />
+{/if}
+
+{#if page === "refine"}
+    <QueryRefiner {config} />
+{/if}
 
 <script>
     import * as util from "./util"
-    import Loading from "./Loading.svelte"
-    import Masonry from "./Masonry.svelte"
+    import SearchResults from "./SearchResults.svelte"
+    import QueryRefiner from "./QueryRefiner.svelte"
+    import NavItem from "./NavItem.svelte"
+    import About from "./About.svelte"
 
-    const chunkSize = 40
+    document.title = util.hardConfig.name
 
+    let page = "search"
+    let friendlyModeQuery = ""
     let queryTerms = []
     let queryCounter = 0
-
     let config = {}
+
+    const newTextQuery = (content=null) => {
+        queryTerms.push({ type: "text", weight: 1, sign: "+", text: typeof content === "string" ? content : "" })
+        queryTerms = queryTerms
+    }
+
+    let resultPromise
+    let results
+    let error
+
+    const runSearch = async () => {
+        if (!resultPromise) {
+            let args = {
+                "terms": friendlyMode ? [{ text: friendlyModeQuery, weight: 1, sign: "+" }] : queryTerms.filter(x => x.text !== "").map(x => ({ image: x.imageData, text: x.text, embedding: x.embedding, predefined_embedding: x.predefinedEmbedding, weight: x.weight * { "+": 1, "-": -1 }[x.sign] })),
+                "include_video": true
+            }
+
+            util.sendTelemetry("search", {
+                terms: args.terms.map(x => {
+                    if (x.image) {
+                        return { type: "image" }
+                    } else if (x.text) {
+                        return { type: "text", text: x.text }
+                    } else if (x.embedding) {
+                        return { type: "embedding" }
+                    } else if (x.predefined_embedding) {
+                        return { type: "predefined_embedding", embedding: x.predefined_embedding }
+                    }
+                })
+            })
+
+            queryCounter += 1
+            resultPromise = util.doQuery(args).then(res => {
+                error = null
+                results = res
+                resultPromise = null
+            }).catch(e => { error = e; resultPromise = null; console.log("error", e) })
+        }
+    }
+
+    const parseQueryString = queryStringParams => {
+        if (queryStringParams.get("q") && queryTerms.length === 0) {
+            newTextQuery(queryStringParams.get("q"))
+            friendlyModeQuery = queryStringParams.get("q")
+            runSearch()
+        }
+        if (queryStringParams.get("e") && queryTerms.length === 0) {
+            const binaryData = atob(queryStringParams.get("e").replace(/\-/g, "+").replace(/_/g, "/"))
+            const uint16s = new Uint16Array(new Uint8Array(binaryData.split('').map(c => c.charCodeAt(0))).buffer)
+            queryTerms.push({ type: "embedding", weight: 1, sign: "+", embedding: Array.from(uint16s).map(decodeFloat16) })
+            friendlyMode = false
+            runSearch()
+        }
+        if (queryStringParams.get("page")) {
+            page = queryStringParams.get("page")
+        }
+    }
+
+    util.router.subscribe(parseQueryString)
+
+    $: friendlyMode = page === "search"
+
     util.serverConfig.subscribe(x => {
         config = x
     })
@@ -198,8 +327,6 @@
         return `${snd}/${fst}`
     }
 
-    const aspectRatio = result => result[4] ? `aspect-ratio: ${result[4][0]}/${result[4][1]}` : null
-
     const decodeFloat16 = uint16 => {
         const sign = (uint16 & 0x8000) ? -1 : 1
         const exponent = (uint16 & 0x7C00) >> 10
@@ -215,73 +342,8 @@
     }
 
     const focusEl = el => el.focus()
-    const newTextQuery = (content=null) => {
-        queryTerms.push({ type: "text", weight: 1, sign: "+", text: typeof content === "string" ? content : "" })
-        queryTerms = queryTerms
-    }
     const removeTerm = term => {
         queryTerms = queryTerms.filter(x => x !== term)
-    }
-
-    let refreshLayout
-    let heightThreshold
-    let error
-    let pendingImageLoads
-    const recomputeScroll = () => {
-        const maxOffsets = new Map()
-        for (const el of document.querySelectorAll(".result")) {
-            if (el.getAttribute("data-h")) { // layouted
-                const rect = el.getBoundingClientRect()
-                maxOffsets.set(rect.left, Math.max(maxOffsets.get(rect.left) || 0, rect.top))
-            }
-        }
-        heightThreshold = Math.min(...maxOffsets.values())
-        console.log(heightThreshold, pendingImageLoads)
-    }
-    const redrawGrid = async () => {
-        if (refreshLayout) {
-            refreshLayout()
-            await recomputeScroll()
-        }
-    }
-    let resultPromise
-    let results
-    let displayedResults = []
-    const runSearch = async () => {
-        if (!resultPromise) {
-            let args = {
-                "terms": queryTerms.filter(x => x.text !== "").map(x => ({ image: x.imageData, text: x.text, embedding: x.embedding, predefined_embedding: x.predefinedEmbedding, weight: x.weight * { "+": 1, "-": -1 }[x.sign] })),
-                "include_video": true
-            }
-            queryCounter += 1
-            resultPromise = util.doQuery(args).then(res => {
-                error = null
-                results = res
-                resultPromise = null
-                displayedResults = []
-                pendingImageLoads = 0
-                for (let i = 0; i < chunkSize; i++) {
-                    if (i >= results.matches.length) break
-                    displayedResults.push(results.matches[i])
-                    pendingImageLoads += 1
-                }
-                redrawGrid()
-            }).catch(e => { error = e; resultPromise = null })
-        }
-    }
-
-    const handleScroll = () => {
-        if (window.scrollY + window.innerHeight >= heightThreshold && pendingImageLoads === 0) {
-            recomputeScroll()
-            if (window.scrollY + window.innerHeight < heightThreshold) return;
-            let init = displayedResults.length
-            for (let i = 0; i < chunkSize; i++) {
-                if (init + i >= results.matches.length) break
-                displayedResults.push(results.matches[init + i])
-                pendingImageLoads += 1
-            }
-            displayedResults = displayedResults
-        }
     }
 
     const handleKey = ev => {
@@ -295,7 +357,6 @@
     const pickFile = () => {
         input.oninput = ev => {
             currentFile = ev.target.files[0]
-            console.log(currentFile)
             if (currentFile) {
                 let reader = new FileReader()
                 reader.readAsDataURL(currentFile)
@@ -308,23 +369,5 @@
             }
         }
         input.click()
-    }
-
-    const updateCounter = () => {
-        console.log("redraw")
-        pendingImageLoads -= 1
-        redrawGrid()
-    }
-
-    const queryStringParams = new URLSearchParams(window.location.search)
-    if (queryStringParams.get("q")) {
-        newTextQuery(queryStringParams.get("q"))
-        runSearch()
-    }
-    if (queryStringParams.get("e")) {
-        const binaryData = atob(queryStringParams.get("e").replace(/\-/g, "+").replace(/_/g, "/"))
-        const uint16s = new Uint16Array(new Uint8Array(binaryData.split('').map(c => c.charCodeAt(0))).buffer)
-        queryTerms.push({ type: "embedding", weight: 1, sign: "+", embedding: Array.from(uint16s).map(decodeFloat16) })
-        runSearch()
     }
 </script>

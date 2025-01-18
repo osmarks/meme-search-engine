@@ -86,7 +86,7 @@ const calcGrid = async (_masonryArr) => {
 }
   
   
-$: if(masonryElement) { 
+$: if(masonryElement && gridGap) { 
   calcGrid([masonryElement])
 }
   
@@ -106,9 +106,7 @@ $: if(items) { // update if items are changed
     grid-template-columns: repeat(auto-fit, var(--col-width));
     grid-template-rows: masonry;
     justify-content: center;
-    grid-gap: var(--grid-gap);
-    padding: var(--grid-gap);
-    
+    grid-gap: var(--grid-gap);    
   }
   :global(.__grid--masonry > *) { 
     align-self: start 

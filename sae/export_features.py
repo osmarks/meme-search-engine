@@ -43,7 +43,7 @@ with torch.inference_mode():
         reconstructions = model(batch).float()
 
     feature_frequencies = model.reset_counters()
-    features = model.up_proj.weight.cpu().numpy()
+    features = model.down_proj.weight.cpu().numpy()
 
 meme_search_backend = "http://localhost:1707/"
 memes_url = "https://i.osmarks.net/memes-or-something/"
@@ -54,8 +54,8 @@ def emb_url(embedding):
 
 async def get_exemplars():
     async with aiohttp.ClientSession():
-        for base in tqdm(range(0, len(features), retrieve_batch_size)):
-            chunk = features[base:base + retrieve_batch_size]
+        for base in tqdm(range(0, features.shape[1], retrieve_batch_size)):
+            chunk = features[:, base:base + retrieve_batch_size].T
             with open(f"feature_dumps/features{base}.html", "w") as f:
                 f.write("""<!DOCTYPE html>
         <title>Embeddings SAE Features</title>

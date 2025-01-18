@@ -1,7 +1,7 @@
 {
   "devDependencies": {
-    "esbuild": "^0.12.15",
-    "esbuild-svelte": "^0.5.3",
+    "esbuild": "^0.13.5",
+    "esbuild-svelte": "^0.6.3",
     "sass": "^1.68.0",
     "svelte-preprocess-sass": "^2.0.1"
   }

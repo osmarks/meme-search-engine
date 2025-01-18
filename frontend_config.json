@@ -1,5 +1,8 @@
 {
     "backend_url": "http://localhost:5601/",
     "image_path": "",
-    "thumb_path": null
+    "thumb_path": null,
+    "description": "Organizing the world's memes.",
+    "name": "Nooscope",
+    "telemetry_endpoint": "/telemetry"
 }

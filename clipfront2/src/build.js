@@ -7,7 +7,7 @@ esbuild
     .build({
         entryPoints: [path.join(__dirname, "app.js")],
         bundle: true,
-        minify: true,
+        minify: false,
         outfile: path.join(__dirname, "../static/app.js"),
         plugins: [sveltePlugin({
             preprocess: {
@@ -17,7 +17,8 @@ esbuild
         loader: {
             ".woff": "file",
             ".woff2": "file",
-            ".ttf": "file"
+            ".ttf": "file",
+            ".png": "file"
         },
         logLevel: "info",
         watch: process.argv.join(" ").includes("watch")
