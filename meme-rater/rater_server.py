@@ -30,9 +30,10 @@ async def index(request):
     return web.Response(text=f"""
 <!DOCTYPE html>
 <html>
+    <title>Data Labelling Frontend (Not Evil)</title>
     <style>
 .memes img {{
-  width: 45%; 
+  width: 45%;
 }}
 
 @media (max-width: 768px) {{
@@ -46,38 +47,71 @@ async def index(request):
 }}
     </style>
     <body>
-        <h1>Meme Rating</h1>
+        <h1>Data Labelling Frontend (Not Evil)</h1>
         <form action="/rate" method="POST">
-            <input type="radio" name="rating" value="1" id="rating1"> <label for="rating1">Meme 1 is better</label>
-            <input type="radio" name="rating" value="2" id="rating2"> <label for="rating2">Meme 2 is better</label>
+            <table>
+            <tr>
+            <td><input type="radio" name="rating-useful" value="1" id="rq1"> <label for="rq1">LHS is better (useful)</label></td>
+            <td><input type="radio" name="rating-useful" value="eq" id="rqe"> <label for="rqe">Tie</label></td>
+            <td><input type="radio" name="rating-useful" value="2" id="rq2"> <label for="rq2">RHS is better (useful)</label></td>
+            </tr>
+            <tr>
+            <td><input type="radio" name="rating-meme" value="1" id="rm1"> <label for="rm1">LHS is better (memetically)</label></td>
+            <td><input type="radio" name="rating-meme" value="eq" id="rme"> <label for="rme">Tie</label></td>
+            <td><input type="radio" name="rating-meme" value="2" id="rm2"> <label for="rm2">RHS is better (memetically)</label></td>
+            </tr>
+            <tr>
+            <td><input type="radio" name="rating-aesthetic" value="1" id="ra1"> <label for="ra1">LHS is better (aesthetically)</label></td>
+            <td><input type="radio" name="rating-aesthetic" value="eq" id="rae"> <label for="rae">Tie</label></td>
+            <td><input type="radio" name="rating-aesthetic" value="2" id="ra2"> <label for="ra2">RHS is better (aesthetically)</label></td>
+            </td>
+            </table>
 
             <input type="hidden" name="meme1" value="{meme1}">
             <input type="hidden" name="meme2" value="{meme2}">
             <input type="hidden" name="iteration" value="{str(iteration or 0)}">
             <input type="submit" value="Submit">
             <div class="memes">
-                <img src="/memes/{meme1}" id="meme1">
-                <img src="/memes/{meme2}" id="meme2">
+                <img src="{meme1}" id="meme1">
+                <img src="{meme2}" id="meme2">
             </div>
         </form>
         <script>
-            document.addEventListener("keypress", function(event) {{
-                if (event.key === "1") {{
-                    document.querySelector("input[name='rating'][value='1']").checked = true
-                    document.querySelector("form").submit()
-                }} else if (event.key === "2") {{
-                    document.querySelector("input[name='rating'][value='2']").checked = true
+            const commitIfReady = () => {{
+                if (document.querySelector("input[name='rating-useful']:checked") && document.querySelector("input[name='rating-meme']:checked") && document.querySelector("input[name='rating-aesthetic']:checked")) {{
                     document.querySelector("form").submit()
                 }}
+            }}
+            document.addEventListener("keypress", function(event) {{
+                if (event.key === "q") {{
+                    document.querySelector("input[name='rating-useful'][value='1']").checked = true
+                    commitIfReady()
+                }} else if (event.key === "w") {{
+                    document.querySelector("input[name='rating-useful'][value='eq']").checked = true
+                    commitIfReady()
+                }} else if (event.key === "e") {{
+                    document.querySelector("input[name='rating-useful'][value='2']").checked = true
+                    commitIfReady()
+                }} else if (event.key === "a") {{
+                    document.querySelector("input[name='rating-meme'][value='1']").checked = true
+                    commitIfReady()
+                }} else if (event.key === "s") {{
+                    document.querySelector("input[name='rating-meme'][value='eq']").checked = true
+                    commitIfReady()
+                }} else if (event.key === "d") {{
+                    document.querySelector("input[name='rating-meme'][value='2']").checked = true
+                    commitIfReady()
+                }} else if (event.key === "z") {{
+                    document.querySelector("input[name='rating-aesthetic'][value='1']").checked = true
+                    commitIfReady()
+                }} else if (event.key === "x") {{
+                    document.querySelector("input[name='rating-aesthetic'][value='eq']").checked = true
+                    commitIfReady()
+                }} else if (event.key === "c") {{
+                    document.querySelector("input[name='rating-aesthetic'][value='2']").checked = true
+                    commitIfReady()
+                }}
             }});
-            document.querySelector("#meme1").addEventListener("click", function(event) {{
-                document.querySelector("input[name='rating'][value='1']").checked = true
-                document.querySelector("form").submit()
-            }})
-            document.querySelector("#meme2").addEventListener("click", function(event) {{
-                document.querySelector("input[name='rating'][value='2']").checked = true
-                document.querySelector("form").submit()
-            }})
         </script>
     </body>
 </html>
@@ -90,8 +124,8 @@ async def rate(request):
     meme1 = post["meme1"]
     meme2 = post["meme2"]
     iteration = post["iteration"]
-    rating = post["rating"]
-    await db.execute("INSERT INTO ratings (meme1, meme2, rating, iteration) VALUES (?, ?, ?, ?)", (meme1, meme2, rating, iteration))
+    rating = post["rating-useful"] + "," + post["rating-meme"] + "," + post["rating-aesthetic"]
+    await db.execute("INSERT INTO ratings (meme1, meme2, rating, iteration, ip) VALUES (?, ?, ?, ?, ?)", (meme1, meme2, rating, iteration, request.remote))
     await db.execute("DELETE FROM queue WHERE meme1 = ? AND meme2 = ?", (meme1, meme2))
     await db.commit()
     return web.HTTPFound("/")
@@ -104,6 +138,7 @@ CREATE TABLE IF NOT EXISTS ratings (
     meme2 TEXT NOT NULL,
     rating TEXT NOT NULL,
     iteration TEXT,
+    ip TEXT,
     UNIQUE (meme1, meme2)
 );
 CREATE TABLE IF NOT EXISTS queue (

@@ -2,10 +2,11 @@
 
 import json
 import matplotlib.pyplot as plt
+import sys
 
 # Read data from log.jsonl
 data = []
-with open('log.jsonl', 'r') as file:
+with open(sys.argv[1], 'r') as file:
     for line in file:
         data.append(json.loads(line))
 

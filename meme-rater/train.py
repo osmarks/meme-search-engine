@@ -36,7 +36,8 @@ config = TrainConfig(
         n_ensemble=16,
         device=device,
         dtype=torch.float32,
-        dropout=0.1
+        dropout=0.1,
+        output_channels=3
     ),
     lr=3e-4,
     weight_decay=0.2,
@@ -72,12 +73,12 @@ if config.compile:
     print("compiling...")
     train_step = torch.compile(train_step)
 
-def batch_from_inputs(inputs: list[tuple[numpy.ndarray, numpy.ndarray, float]]):
+def batch_from_inputs(inputs: list[list[tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray]]]):
     batch_input = torch.stack([
         torch.stack([ torch.stack((torch.Tensor(emb1).to(config.model.dtype), torch.Tensor(emb2).to(config.model.dtype))) for emb1, emb2, rating in input ])
         for input in inputs
     ]).to(device)
-    target = torch.stack([ torch.Tensor([ rating for emb1, emb2, rating in input ]) for input in inputs ]).to(device)
+    target = torch.stack([ torch.Tensor(numpy.array([ rating for emb1, emb2, rating in input ])).to(config.model.dtype) for input in inputs ]).to(device)
     return batch_input, target
 
 def evaluate(steps):
@@ -118,7 +119,7 @@ with open(logfile, "w") as log:
                 print(steps, loss)
                 log.write(json.dumps({"loss": loss, "step": steps, "time": time.time()}) + "\n")
                 if steps % 10 == 0:
-                    if steps % 250 == 0: save_ckpt(log, steps)
+                    if steps % 100 == 0: save_ckpt(log, steps)
                     loss = evaluate(steps)
                     #print(loss)
                     #best = min(loss, best)

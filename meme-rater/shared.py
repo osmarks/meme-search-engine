@@ -3,6 +3,7 @@ import hashlib
 from collections import defaultdict
 import numpy
 import random
+import numpy as np
 
 db = sqlite3.connect("data.sqlite3")
 db.row_factory = sqlite3.Row
@@ -20,19 +21,24 @@ def fetch_embedding(filename):
     return x.copy() # PyTorch complains otherwise due to bad
 
 def map_rating(rating, uncertainty=0.05):
-    match rating:
-        case "1": # meme 1 is better
-            return 1 - uncertainty
-        case "2":
-            return uncertainty
-        case _: raise ValueError("invalid rating, please fix")
+    def map_one(rating):
+        match rating:
+            case "1": # meme 1 is better
+                return 1 - uncertainty
+            case "2":
+                return uncertainty
+            case "eq":
+                return 0.5
+            case _: raise ValueError("invalid rating, please fix")
+
+    return np.array([map_one(r) for r in rating.split(",")])
 
 def fetch_ratings():
     trains = defaultdict(list)
     validations = defaultdict(list)
     csr = db.execute("SELECT meme1, meme2, rating, iteration FROM ratings")
     for meme1, meme2, rating, iteration in csr.fetchall():
-        (validations if is_val_set(meme1, meme2) else trains)[int(iteration or "0")].append((fetch_embedding(meme1), fetch_embedding(meme2), map_rating(rating)))
+        (validations if is_val_set(meme1, meme2) else trains)[int((iteration and iteration.split("-")[0]) or "0")].append((fetch_embedding(meme1), fetch_embedding(meme2), map_rating(rating)))
     csr.close()
     return list(x[1] for x in sorted(trains.items())), list(x[1] for x in sorted(validations.items()))
 

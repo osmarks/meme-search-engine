@@ -13,13 +13,14 @@ class Config:
     device: str
     dtype: torch.dtype
     dropout: float
+    output_channels: int
 
 class Model(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.hidden = nn.ModuleList([ nn.Linear(config.d_emb, config.d_emb, dtype=config.dtype, device=config.device) for _ in range(config.n_hidden) ])
         self.dropout = nn.ModuleList([ nn.Dropout(p=config.dropout) for _ in range(config.n_hidden) ])
-        self.output = nn.Linear(config.d_emb, 1, dtype=config.dtype, device=config.device)
+        self.output = nn.Linear(config.d_emb, config.output_channels, dtype=config.dtype, device=config.device)
 
     def forward(self, embs):
         x = embs
@@ -34,8 +35,7 @@ class Ensemble(nn.Module):
 
     # model batch
     def forward(self, embs):
-        xs = torch.stack([ x(embs[i]) for i, x in enumerate(self.models) ]) # model batch output_dim=1
-        return xs.squeeze(-1)
+        return torch.stack([ x(embs[i]) for i, x in enumerate(self.models) ]) # model batch output_dim=1
 
 class BradleyTerry(nn.Module):
     def __init__(self, config):

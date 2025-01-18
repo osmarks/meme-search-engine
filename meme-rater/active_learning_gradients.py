@@ -8,11 +8,11 @@ import json
 import time
 from tqdm import tqdm
 from torch.func import functional_call, vmap, grad
+import sys
 
 from model import Config, BradleyTerry
 import shared
 
-steps = 855
 batch_size = 128
 num_pairs = batch_size * 1024
 device = "cuda"
@@ -22,10 +22,12 @@ config = Config(
     n_hidden=1,
     n_ensemble=1,
     device=device,
-    dtype=torch.bfloat16
+    dtype=torch.float32,
+    output_channels=3,
+    dropout=0.1
 )
 model = BradleyTerry(config)
-modelc, _ = shared.checkpoint_for(855)
+modelc, _ = shared.checkpoint_for(int(sys.argv[1]))
 model.load_state_dict(torch.load(modelc))
 params = sum(p.numel() for p in model.parameters())
 print(f"{params/1e6:.1f}M parameters")
@@ -61,7 +63,7 @@ for bstart in tqdm(range(0, len(pairs), batch_size)):
     #win_probs = model(inputs)
     # TODO gradients
     # don't take variance: do backwards pass and compute gradient norm
-    grads = ft_compute_sample_grad(params, buffers, inputs, torch.full((1, batch_size), 0.95).to(device))
+    grads = ft_compute_sample_grad(params, buffers, inputs, torch.full((1, batch_size, config.output_channels), 0.95).to(device))
     total_grad_norms = torch.zeros(batch_size).to(device)
     for k, v in grads.items():
         param_dims = tuple(range(1, len(v.shape)))
