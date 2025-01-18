@@ -119,7 +119,7 @@ with open(logfile, "w") as log:
                 print(steps, loss)
                 log.write(json.dumps({"loss": loss, "step": steps, "time": time.time()}) + "\n")
                 if steps % 10 == 0:
-                    if steps % 100 == 0: save_ckpt(log, steps)
+                    if steps % 50 == 0: save_ckpt(log, steps)
                     loss = evaluate(steps)
                     #print(loss)
                     #best = min(loss, best)

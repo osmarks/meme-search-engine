@@ -152,7 +152,7 @@ pub struct PackedIndexEntry {
     pub id: u32,
     pub timestamp: u64,
     pub dimensions: (u32, u32),
-    pub score: f32,
+    pub scores: Vec<f32>,
     pub url: String,
     pub shards: Vec<u32>
 }

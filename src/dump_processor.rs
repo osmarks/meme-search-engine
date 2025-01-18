@@ -18,6 +18,7 @@ use std::os::unix::prelude::FileExt;
 use diskann::vector::{scale_dot_result_f64, ProductQuantizer};
 
 mod common;
+mod score_model;
 
 use common::{ProcessedEntry, ShardInputHeader, ShardedRecord, ShardHeader, PackedIndexEntry, IndexHeader};
 
@@ -62,6 +63,10 @@ struct CLIArguments {
     json: bool,
     #[argh(option, short='f', description="k-means balance fudge factor", default="0.2")]
     balance_fudge: f64,
+    #[argh(option, short='M', description="score model path")]
+    score_model: Option<String>,
+    #[argh(option, short='G', description="GPU (CUDA) device to use")]
+    gpu: Option<usize>
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -124,7 +129,7 @@ const SHARD_SPILL: usize = 2;
 const RECORD_PAD_SIZE: usize = 4096; // NVMe disk sector size
 const D_EMB: u32 = 1152;
 const EMPTY_LOOKUP: (u32, u64, u32) = (u32::MAX, 0, 0);
-const BATCH_SIZE: usize = 1024;
+const BATCH_SIZE: usize = 2048;
 
 #[derive(Clone, Serialize, Debug)]
 pub struct JsonEntry<'a> {
@@ -149,7 +154,7 @@ fn main() -> Result<()> {
     // load specified embeddings from files
     let mut embeddings = Vec::new();
     for x in args.embedding {
-        let (name, snd) = x.split_once(':').unwrap();
+        let (name, snd) = x.split_once(':').context("invalid embedding argument")?;
         let (path, threshold) = if let Some((path, threshold)) = snd.split_once(':') {
             (path, Some(threshold.parse::<f32>().context("parse threshold")?))
         } else {
@@ -203,9 +208,9 @@ fn main() -> Result<()> {
             let file = file?;
             let path = file.path();
             let filename = path.file_name().unwrap().to_str().unwrap();
-            let (fst, snd) = filename.split_once(".").unwrap();
+            let (fst, snd) = filename.split_once(".").context("shard filename wrong")?;
 
-            let id: u32 = str::parse(fst)?;
+            let id: u32 = str::parse(fst).context("shard filename wrong")?;
             if let Some(clip) = args.clip_shards {
                 if id >= (clip as u32) {
                     continue;
@@ -283,8 +288,15 @@ fn main() -> Result<()> {
 
     let mut index_output_file = if let Some(index_output) = &args.index_output {
         let main_output = BufWriter::new(fs::File::create(PathBuf::from(index_output).join("index.bin")).context("create index file")?);
-        let pq_codes =BufWriter::new(fs::File::create(PathBuf::from(index_output).join("index.pq-codes.bin")).context("create index file")?);
-        Some((main_output, pq_codes))
+        let pq_codes = BufWriter::new(fs::File::create(PathBuf::from(index_output).join("index.pq-codes.bin")).context("create index file")?);
+        let descriptor_codes = BufWriter::new(fs::File::create(PathBuf::from(index_output).join("index.descriptor-codes.bin")).context("create index file")?);
+        Some((main_output, pq_codes, descriptor_codes))
+    } else {
+        None
+    };
+
+    let score_model = if let Some(score_model) = &args.score_model {
+        Some(score_model::ScoreModel::load(score_model, args.gpu).context("load score model")?)
     } else {
         None
     };
@@ -415,13 +427,16 @@ fn main() -> Result<()> {
         }
 
         if let (Some(read_out_vertices), Some(index_output_file)) = (&mut read_out_vertices, &mut index_output_file) {
-            let quantizer = pq_codec.as_ref().unwrap();
+            let quantizer = pq_codec.as_ref().context("PQ codec needed to output index")?;
 
             let mut batch_embeddings = Vec::with_capacity(batch.len() * D_EMB as usize);
             for (_x, embedding) in batch.iter() {
                 batch_embeddings.extend_from_slice(&embedding);
             }
             let codes = quantizer.quantize_batch(&batch_embeddings);
+
+            let score_model = score_model.as_ref().context("score model needed to output index")?;
+            let scores = score_model.score_batch(&batch_embeddings)?;
 
             for (i, (x, _embedding)) in batch.into_iter().enumerate() {
                 let (vertices, shards) = read_out_vertices(count + i as u32)?; // TODO: could parallelize this given the batching
@@ -431,7 +446,7 @@ fn main() -> Result<()> {
                     vector: x.embedding.chunks_exact(2).map(|x| u16::from_le_bytes([x[0], x[1]])).collect(),
                     timestamp: x.timestamp,
                     dimensions: x.metadata.dimension,
-                    score: 0.5, // TODO
+                    scores: scores[i..(i + score_model.output_channels)].to_vec(),
                     url: x.metadata.final_url,
                     shards
                 };

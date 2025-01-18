@@ -55,7 +55,7 @@ struct Scratch {
     visited: HashSet<u32>,
     neighbour_buffer: NeighbourBuffer,
     neighbour_pre_buffer: Vec<u32>,
-    visited_list: Vec<(u32, i64, String, Vec<u32>)>
+    visited_list: Vec<(u32, i64, String, Vec<u32>, Vec<f32>)>
 }
 
 struct IndexRef<'a> {
@@ -85,7 +85,7 @@ fn greedy_search(scratch: &mut Scratch, start: u32, query: &[f16], query_preproc
         let vector = bytemuck::cast_slice(&node.vector);
         let distance = fast_dot_noprefetch(query, &vector);
         cmps += 1;
-        scratch.visited_list.push((pt, distance, node.url, node.shards));
+        scratch.visited_list.push((pt, distance, node.url, node.shards, node.scores));
         for &neighbour in node.vertices.iter() {
             if scratch.visited.insert(neighbour) {
                 scratch.neighbour_pre_buffer.push(neighbour);
@@ -215,17 +215,17 @@ fn main() -> Result<()> {
             cmps.push(cmps_result.0);
 
             if args.verbose {
-                println!("index scan {}: {:?} cmps", shard, cmps);
+                println!("index scan {}: {:?} cmps", shard, cmps_result);
             }
 
             scratch.visited_list.sort_by_key(|x| -x.1);
-            for (i, (id, distance, url, shards)) in scratch.visited_list.iter().take(20).enumerate() {
+            for (i, (id, distance, url, shards, scores)) in scratch.visited_list.iter().take(20).enumerate() {
                 let found_id = match matches.binary_search(&(*id, 0)) {
                     Ok(pos) => pos,
                     Err(pos) => pos
                 };
                 if args.verbose {
-                    println!("index scan: {} {} {} {:?}; rank {}", id, distance, url, shards, matches[found_id].1 + 1);
+                    println!("index scan: {} {} {} {:?} {:?}; rank {}", id, distance, url, shards, scores, matches[found_id].1 + 1);
                 };
                 top_ranks[i] = std::cmp::min(top_ranks[i], matches[found_id].1);
             }

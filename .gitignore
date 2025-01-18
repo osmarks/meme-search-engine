@@ -20,3 +20,5 @@ diskann/target
 shards
 index
 queries.txt
+*.zst
+.safetensors

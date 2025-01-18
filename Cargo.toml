@@ -57,6 +57,8 @@ bitcode = "0.6"
 simsimd = "6"
 foldhash = "0.1"
 memmap2 = "0.9"
+matrixmultiply = { version = "0.3", features = ["threading"] }
+candle-core = "0.8"
 
 [[bin]]
 name = "reddit-dump"
