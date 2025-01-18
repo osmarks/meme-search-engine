@@ -17,3 +17,6 @@ diskann/target
 */flamegraph.svg
 *.hdf5
 *.v
+shards
+index
+queries.txt
