@@ -57,8 +57,11 @@ bitcode = "0.6"
 simsimd = "6"
 foldhash = "0.1"
 memmap2 = "0.9"
-matrixmultiply = { version = "0.3", features = ["threading"] }
 candle-core = "0.8"
+monoio = "0.2"
+hyper = "1"
+monoio-compat = { version = "0.2", features = ["hyper"] }
+http-body-util = "0.1"
 
 [[bin]]
 name = "reddit-dump"

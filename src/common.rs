@@ -1,4 +1,5 @@
 use image::codecs::bmp::BmpEncoder;
+use lazy_static::lazy_static;
 use serde::{Serialize, Deserialize};
 use std::borrow::Borrow;
 use std::cell::RefCell;
@@ -10,6 +11,11 @@ use tracing::instrument;
 use fast_image_resize::{Resizer, ResizeOptions, ResizeAlg};
 use fast_image_resize::images::{Image, ImageRef};
 use anyhow::Context;
+use std::collections::HashMap;
+use ndarray::ArrayBase;
+use prometheus::{register_int_counter_vec, IntCounterVec};
+use base64::prelude::*;
+use std::future::Future;
 
 std::thread_local! {
     static RESIZER: RefCell<Resizer> = RefCell::new(Resizer::new());
@@ -22,7 +28,7 @@ pub struct InferenceServerConfig {
     pub embedding_size: usize,
 }
 
-pub fn resize_for_embed_sync<T: Borrow<DynamicImage> + Send + 'static>(config: InferenceServerConfig, image: T) -> Result<Vec<u8>> {
+pub fn resize_for_embed_sync<T: Borrow<DynamicImage> + Send + 'static>(config: &InferenceServerConfig, image: T) -> Result<Vec<u8>> {
     // the model currently in use wants aspect ratio 1:1 regardless of input
     // I think this was previously being handled in the CLIP server but that is slightly lossy
 
@@ -48,7 +54,7 @@ pub fn resize_for_embed_sync<T: Borrow<DynamicImage> + Send + 'static>(config: I
 }
 
 pub async fn resize_for_embed<T: Borrow<DynamicImage> + Send + 'static>(config: InferenceServerConfig, image: T) -> Result<Vec<u8>> {
-    let resized = tokio::task::spawn_blocking(move || resize_for_embed_sync(config, image)).await??;
+    let resized = tokio::task::spawn_blocking(move || resize_for_embed_sync(&config, image)).await??;
     Ok(resized)
 }
 
@@ -163,5 +169,103 @@ pub struct IndexHeader {
     pub count: u32,
     pub dead_count: u32,
     pub record_pad_size: usize,
-    pub quantizer: diskann::vector::ProductQuantizer
+    pub quantizer: diskann::vector::ProductQuantizer,
+    pub descriptor_cdfs: Vec<Vec<f32>>
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct FrontendInit {
+    pub n_total: u64,
+    pub predefined_embedding_names: Vec<String>,
+    pub d_emb: usize
+}
+
+pub type EmbeddingVector = Vec<f32>;
+
+#[derive(Debug, Serialize)]
+pub struct QueryResult {
+    pub matches: Vec<(f32, String, String, u64, Option<(u32, u32)>)>,
+    pub formats: Vec<String>,
+    pub extensions: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueryTerm {
+    pub embedding: Option<EmbeddingVector>,
+    pub image: Option<String>,
+    pub text: Option<String>,
+    pub predefined_embedding: Option<String>,
+    pub weight: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct QueryRequest {
+    pub terms: Vec<QueryTerm>,
+    pub k: Option<usize>,
+    #[serde(default)]
+    pub include_video: bool
+}
+
+lazy_static::lazy_static! {
+    static ref TERMS_COUNTER: IntCounterVec = register_int_counter_vec!("mse_terms", "terms used in queries, by type", &["type"]).unwrap();
+}
+
+pub async fn get_total_embedding<A: Future<Output = Result<Vec<Vec<u8>>>>, B: Future<Output = Result<serde_bytes::ByteBuf>>, S: Clone, T: Clone, F: Fn(EmbeddingRequest, S) -> A, G: Fn(Vec<u8>, T) -> B>(terms: &Vec<QueryTerm>, ic: &InferenceServerConfig, query_server: F, resize_image: G, predefined_embeddings: &HashMap<String, ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<[usize; 1]>>>, image_state: T, query_state: S) -> Result<Vec<f32>> {
+    let mut total_embedding = ndarray::Array::from(vec![0.0; ic.embedding_size]);
+
+    let mut image_batch = Vec::new();
+    let mut image_weights = Vec::new();
+    let mut text_batch = Vec::new();
+    let mut text_weights = Vec::new();
+
+    for term in terms {
+        if let Some(image) = &term.image {
+            TERMS_COUNTER.get_metric_with_label_values(&["image"]).unwrap().inc();
+            let bytes = BASE64_STANDARD.decode(image)?;
+            image_batch.push(resize_image(bytes, image_state.clone()).await?);
+            image_weights.push(term.weight.unwrap_or(1.0));
+        }
+        if let Some(text) = &term.text {
+            TERMS_COUNTER.get_metric_with_label_values(&["text"]).unwrap().inc();
+            text_batch.push(text.clone());
+            text_weights.push(term.weight.unwrap_or(1.0));
+        }
+        if let Some(embedding) = &term.embedding {
+            TERMS_COUNTER.get_metric_with_label_values(&["embedding"]).unwrap().inc();
+            let weight = term.weight.unwrap_or(1.0);
+            for (i, value) in embedding.iter().enumerate() {
+                total_embedding[i] += value * weight;
+            }
+        }
+        if let Some(name) = &term.predefined_embedding {
+            let embedding = predefined_embeddings.get(name).context("name invalid")?;
+            total_embedding = total_embedding + embedding * term.weight.unwrap_or(1.0);
+        }
+    }
+
+    let mut batches = vec![];
+
+    if !image_batch.is_empty() {
+        batches.push(
+            (EmbeddingRequest::Images {
+                images: image_batch
+            }, image_weights)
+        );
+    }
+    if !text_batch.is_empty() {
+        batches.push(
+            (EmbeddingRequest::Text {
+                text: text_batch,
+            }, text_weights)
+        );
+    }
+
+    for (batch, weights) in batches {
+        let embs: Vec<Vec<u8>> = query_server(batch, query_state.clone()).await?;
+        for (emb, weight) in embs.into_iter().zip(weights) {
+            total_embedding += &(ndarray::Array::from_vec(decode_fp16_buffer(&emb)) * weight);
+        }
+    }
+
+    Ok(total_embedding.to_vec())
 }

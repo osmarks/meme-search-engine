@@ -13,7 +13,7 @@ use axum::{
     Router,
     http::StatusCode
 };
-use common::resize_for_embed_sync;
+use common::{resize_for_embed_sync, FrontendInit};
 use compact_str::CompactString;
 use image::RgbImage;
 use image::{imageops::FilterType, ImageReader, DynamicImage, ImageFormat};
@@ -24,7 +24,6 @@ use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tokio::task::JoinHandle;
 use walkdir::WalkDir;
-use base64::prelude::*;
 use faiss::{ConcurrentIndex, Index};
 use futures_util::stream::{StreamExt, TryStreamExt};
 use tokio_stream::wrappers::ReceiverStream;
@@ -32,20 +31,19 @@ use tower_http::cors::CorsLayer;
 use faiss::index::scalar_quantizer;
 use lazy_static::lazy_static;
 use prometheus::{register_int_counter, register_int_counter_vec, register_int_gauge, Encoder, IntCounter, IntGauge, IntCounterVec};
-use ndarray::ArrayBase;
 use tracing::instrument;
+use base64::prelude::{BASE64_URL_SAFE_NO_PAD, Engine};
 
 mod ocr;
 mod common;
 mod video_reader;
 
 use crate::ocr::scan_image;
-use crate::common::{InferenceServerConfig, resize_for_embed, EmbeddingRequest, get_backend_config, query_clip_server, decode_fp16_buffer};
+use crate::common::{InferenceServerConfig, resize_for_embed, EmbeddingRequest, get_backend_config, query_clip_server, decode_fp16_buffer, QueryRequest, QueryResult, EmbeddingVector};
 
 lazy_static! {
     static ref RELOADS_COUNTER: IntCounter = register_int_counter!("mse_reloads", "reloads executed").unwrap();
     static ref QUERIES_COUNTER: IntCounter = register_int_counter!("mse_queries", "queries executed").unwrap();
-    static ref TERMS_COUNTER: IntCounterVec = register_int_counter_vec!("mse_terms", "terms used in queries, by type", &["type"]).unwrap();
     static ref IMAGES_LOADED_COUNTER: IntCounter = register_int_counter!("mse_loads", "images loaded by ingest process").unwrap();
     static ref IMAGES_LOADED_ERROR_COUNTER: IntCounter = register_int_counter!("mse_load_errors", "image load fails by ingest process").unwrap();
     static ref VIDEOS_LOADED_COUNTER: IntCounter = register_int_counter!("mse_video_loads", "video loaded by ingest process").unwrap();
@@ -79,6 +77,13 @@ struct Config {
     no_run_server: bool,
     #[serde(default="function_which_will_return_the_integer_one_successor_of_zero_but_as_a_float")]
     video_frame_interval: f32
+}
+
+#[derive(Debug, Clone)]
+struct WConfig {
+    backend: InferenceServerConfig,
+    service: Config,
+    predefined_embeddings: HashMap<String, ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<[usize; 1]>>>
 }
 
 #[derive(Debug)]
@@ -145,13 +150,6 @@ struct FileRecord {
     needs_ocr: bool,
     needs_thumbnail: bool,
     needs_metadata: bool
-}
-
-#[derive(Debug, Clone)]
-struct WConfig {
-    backend: InferenceServerConfig,
-    service: Config,
-    predefined_embeddings: HashMap<String, ArrayBase<ndarray::OwnedRepr<f32>, ndarray::prelude::Dim<[usize; 1]>>>
 }
 
 #[derive(Debug)]
@@ -387,7 +385,7 @@ async fn load_image(record: FileRecord, to_embed_tx: mpsc::Sender<EmbeddingInput
                 let mut last_metadata = None;
                 let callback = |frame: RgbImage| {
                     let frame: Arc<DynamicImage> = Arc::new(frame.into());
-                    let embed_buf = resize_for_embed_sync(config.backend.clone(), frame.clone())?;
+                    let embed_buf = resize_for_embed_sync(&config.backend, frame.clone())?;
                     let filename = Filename::VideoFrame(filename.clone(), i);
                     to_embed_tx.blocking_send(EmbeddingInput {
                         image: embed_buf,
@@ -893,32 +891,6 @@ async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
     Ok(index)
 }
 
-type EmbeddingVector = Vec<f32>;
-
-#[derive(Debug, Serialize)]
-struct QueryResult {
-    matches: Vec<(f32, String, String, u64, Option<(u32, u32)>)>,
-    formats: Vec<String>,
-    extensions: HashMap<String, String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QueryTerm {
-    embedding: Option<EmbeddingVector>,
-    image: Option<String>,
-    text: Option<String>,
-    predefined_embedding: Option<String>,
-    weight: Option<f32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct QueryRequest {
-    terms: Vec<QueryTerm>,
-    k: Option<usize>,
-    #[serde(default)]
-    include_video: bool
-}
-
 #[instrument(skip(index))]
 async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bool) -> Result<QueryResult> {
     let result = index.vectors.search(&query, k as usize)?;
@@ -958,65 +930,22 @@ async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bo
 
 #[instrument(skip(config, client, index))]
 async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IIndex, req: Json<QueryRequest>) -> Result<Response<Body>> {
-    let mut total_embedding = ndarray::Array::from(vec![0.0; config.backend.embedding_size]);
-
-    let mut image_batch = Vec::new();
-    let mut image_weights = Vec::new();
-    let mut text_batch = Vec::new();
-    let mut text_weights = Vec::new();
-
-    for term in &req.terms {
-        if let Some(image) = &term.image {
-            TERMS_COUNTER.get_metric_with_label_values(&["image"]).unwrap().inc();
-            let bytes = BASE64_STANDARD.decode(image)?;
-            let image = Arc::new(tokio::task::block_in_place(|| image::load_from_memory(&bytes))?);
-            image_batch.push(serde_bytes::ByteBuf::from(resize_for_embed(config.backend.clone(), image).await?));
-            image_weights.push(term.weight.unwrap_or(1.0));
-        }
-        if let Some(text) = &term.text {
-            TERMS_COUNTER.get_metric_with_label_values(&["text"]).unwrap().inc();
-            text_batch.push(text.clone());
-            text_weights.push(term.weight.unwrap_or(1.0));
-        }
-        if let Some(embedding) = &term.embedding {
-            TERMS_COUNTER.get_metric_with_label_values(&["embedding"]).unwrap().inc();
-            let weight = term.weight.unwrap_or(1.0);
-            for (i, value) in embedding.iter().enumerate() {
-                total_embedding[i] += value * weight;
-            }
-        }
-        if let Some(name) = &term.predefined_embedding {
-            let embedding = config.predefined_embeddings.get(name).context("name invalid")?;
-            total_embedding = total_embedding + embedding * term.weight.unwrap_or(1.0);
-        }
-    }
-
-    let mut batches = vec![];
-
-    if !image_batch.is_empty() {
-        batches.push(
-            (EmbeddingRequest::Images {
-                images: image_batch
-            }, image_weights)
-        );
-    }
-    if !text_batch.is_empty() {
-        batches.push(
-            (EmbeddingRequest::Text {
-                text: text_batch,
-            }, text_weights)
-        );
-    }
-
-    for (batch, weights) in batches {
-        let embs: Vec<Vec<u8>> = query_clip_server(&client, &config.service.clip_server, "/", batch).await?;
-        for (emb, weight) in embs.into_iter().zip(weights) {
-            total_embedding += &(ndarray::Array::from_vec(decode_fp16_buffer(&emb)) * weight);
-        }
-    }
+    let embedding = common::get_total_embedding(
+        &req.terms,
+        &config.backend,
+        |batch, (config, client)| async move {
+            query_clip_server(&client, &config.service.clip_server, "", batch).await
+        },
+        |image, config| async move {
+            let image = Arc::new(tokio::task::block_in_place(|| image::load_from_memory(&image))?);
+            Ok(serde_bytes::ByteBuf::from(resize_for_embed(config.backend.clone(), image).await?))
+        },
+        &config.clone().predefined_embeddings,
+        config.clone(),
+        (config.clone(), client.clone())).await?;
 
     let k = req.k.unwrap_or(1000);
-    let qres = query_index(index, total_embedding.to_vec(), k, req.include_video).await?;
+    let qres = query_index(index, embedding, k, req.include_video).await?;
 
     let mut extensions = HashMap::new();
     for (k, v) in image_formats(&config.service) {
@@ -1028,13 +957,6 @@ async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IInde
         formats: qres.formats,
         extensions,
     }).into_response())
-}
-
-#[derive(Serialize, Deserialize)]
-struct FrontendInit {
-    n_total: u64,
-    predefined_embedding_names: Vec<String>,
-    d_emb: usize
 }
 
 #[tokio::main]

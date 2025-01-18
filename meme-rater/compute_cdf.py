@@ -9,12 +9,18 @@ import time
 from tqdm import tqdm
 import sys
 from collections import defaultdict
+import msgpack
 
 from model import Config, BradleyTerry
 import shared
 
-batch_size = 128
-num_pairs = batch_size * 1024
+def fetch_files_with_timestamps():
+    csr = shared.db.execute("SELECT filename, embedding, timestamp FROM files WHERE embedding IS NOT NULL")
+    x = [ (row[0], numpy.frombuffer(row[1], dtype="float16").copy(), row[2]) for row in csr.fetchall() ]
+    csr.close()
+    return x
+
+batch_size = 2048
 device = "cuda"
 
 config = Config(
@@ -27,36 +33,42 @@ config = Config(
     dropout=0.1
 )
 model = BradleyTerry(config)
+model.eval()
 modelc, _ = shared.checkpoint_for(int(sys.argv[1]))
 model.load_state_dict(torch.load(modelc))
 params = sum(p.numel() for p in model.parameters())
 print(f"{params/1e6:.1f}M parameters")
 print(model)
 
-files = shared.fetch_all_files()
-results = {}
+for x in model.ensemble.models:
+    x.output.bias.data.fill_(0) # hack to match behaviour of cut-down implementation
+
+results = defaultdict(list)
 model.eval()
+
+files = fetch_files_with_timestamps()
 
 with torch.inference_mode():
     for bstart in tqdm(range(0, len(files), batch_size)):
         batch = files[bstart:bstart + batch_size]
-        filenames = [ f1 for f1, e1 in batch ]
-        embs = torch.stack([ torch.Tensor(e1).to(config.dtype) for f1, e1 in batch ])
+        timestamps = [ t1 for f1, e1, t1 in batch ]
+        embs = torch.stack([ torch.Tensor(e1).to(config.dtype) for f1, e1, t1 in batch ])
         inputs = embs.unsqueeze(0).expand((config.n_ensemble, len(batch), config.d_emb)).to(device)
-        scores = model.ensemble(inputs).median(dim=0).values.cpu().numpy()
+        scores = model.ensemble(inputs).mean(dim=0).cpu().numpy()
+        for sr in scores:
+            for i, s in enumerate(sr):
+                results[i].append(s)
+        # add an extra timestamp channel
+        results[config.output_channels].extend(timestamps)
 
+cdfs = []
+# we want to encode scores in one byte, and 255/0xFF is reserved for "greater than maximum bucket"
+cdf_bins = 255
+for i, s in results.items():
+    quantiles = numpy.linspace(0, 1, cdf_bins)
+    cdf = numpy.quantile(numpy.array(s), quantiles)
+    print(cdf)
+    cdfs.append(cdf.tolist())
 
-channel = int(sys.argv[2])
-percentile = float(sys.argv[3])
-output_pairs = int(sys.argv[4])
-mean_scores = numpy.mean(numpy.stack([score for filename, score in results.items()]))
-top = sorted(((filename, score) for filename, score in results.items() if (score > mean_scores).all()), key=lambda x: x[1][channel], reverse=True)
-select_from = top[:int(len(top) * percentile)]
-
-out = []
-for _ in range(output_pairs):
-    # dummy score for compatibility with existing code
-    out.append(((random.choice(select_from)[0], random.choice(select_from)[0]), 0))
-
-with open("top.json", "w") as f:
-    json.dump(out, f)
+with open("cdfs.msgpack", "wb") as f:
+    msgpack.pack(cdfs, f)

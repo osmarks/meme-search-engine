@@ -66,7 +66,9 @@ struct CLIArguments {
     #[argh(option, short='M', description="score model path")]
     score_model: Option<String>,
     #[argh(option, short='G', description="GPU (CUDA) device to use")]
-    gpu: Option<usize>
+    gpu: Option<usize>,
+    #[argh(option, description="descriptor CDFs")]
+    cdfs: Option<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -301,6 +303,13 @@ fn main() -> Result<()> {
         None
     };
 
+    let cdfs = if let Some(cdfs) = &args.cdfs {
+        let data = fs::read(cdfs).context("read cdfs")?;
+        Some(rmp_serde::from_read::<_, Vec<Vec<f32>>>(&data[..]).context("decode cdfs")?)
+    } else {
+        None
+    };
+
     let mut output_file = args.output_embeddings.map(|x| fs::File::create(x).context("create output file")).transpose()?;
 
     let mut i: u64 = 0;
@@ -436,17 +445,33 @@ fn main() -> Result<()> {
             let codes = quantizer.quantize_batch(&batch_embeddings);
 
             let score_model = score_model.as_ref().context("score model needed to output index")?;
+            let cdfs = cdfs.as_ref().context("score model CDFs needed to output index")?;
             let scores = score_model.score_batch(&batch_embeddings)?;
 
             for (i, (x, _embedding)) in batch.into_iter().enumerate() {
                 let (vertices, shards) = read_out_vertices(count + i as u32)?; // TODO: could parallelize this given the batching
+
+                let mut entry_scores = scores[i..(i + score_model.output_channels)].to_vec();
+
+                entry_scores.push(x.timestamp as f32); // seconds since epoch, so precision issues aren't awful
+
+                for (index, score) in entry_scores.iter().enumerate() {
+                    // binary search CDF to invert
+                    let cdf_bucket: u8 = match cdfs[index].binary_search_by(|x| x.partial_cmp(score).unwrap()) {
+                        Ok(x) => x.try_into().unwrap(),
+                        Err(x) => x.try_into().unwrap()
+                    };
+                    // write score descriptor to descriptors file
+                    index_output_file.2.write_all(&[cdf_bucket])?;
+                }
+
                 let mut entry = PackedIndexEntry {
                     id: count + i as u32,
                     vertices,
                     vector: x.embedding.chunks_exact(2).map(|x| u16::from_le_bytes([x[0], x[1]])).collect(),
                     timestamp: x.timestamp,
                     dimensions: x.metadata.dimension,
-                    scores: scores[i..(i + score_model.output_channels)].to_vec(),
+                    scores: entry_scores,
                     url: x.metadata.final_url,
                     shards
                 };
@@ -504,7 +529,8 @@ fn main() -> Result<()> {
             count: count as u32,
             record_pad_size: RECORD_PAD_SIZE,
             dead_count,
-            quantizer: pq_codec.unwrap()
+            quantizer: pq_codec.unwrap(),
+            descriptor_cdfs: cdfs.unwrap(),
         };
         file.write_all(rmp_serde::to_vec_named(&header)?.as_slice())?;
     }
