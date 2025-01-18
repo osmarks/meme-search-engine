@@ -316,7 +316,7 @@ pub struct ProductQuantizer {
 }
 
 // chunk * centroid_index
-pub struct DistanceLUT(Vec<f32>);
+pub struct QueryLUT(Vec<f32>);
 
 impl ProductQuantizer {
     pub fn apply_transform(&self, x: &[f32]) -> Vec<f32> {
@@ -366,7 +366,7 @@ impl ProductQuantizer {
     }
 
     // not particularly performance-sensitive right now; do unbatched
-    pub fn preprocess_query(&self, query: &[f32]) -> DistanceLUT {
+    pub fn preprocess_query(&self, query: &[f32]) -> QueryLUT {
         let transformed = self.apply_transform(query);
         let n_chunks = self.n_dims / self.n_dims_per_code;
         let n_centroids = self.centroids.len() / self.n_dims;
@@ -382,11 +382,11 @@ impl ProductQuantizer {
             }
         }
 
-        DistanceLUT(lut)
+        QueryLUT(lut)
     }
 
     // compute dot products of query against product-quantized vectors
-    pub fn asymmetric_dot_product(&self, query: &DistanceLUT, pq_vectors: &[u8]) -> Vec<i64> {
+    pub fn asymmetric_dot_product(&self, query: &QueryLUT, pq_vectors: &[u8]) -> Vec<i64> {
         let n_chunks = self.n_dims / self.n_dims_per_code;
         let n_vectors = pq_vectors.len() / n_chunks;
         let mut scores = vec![0.0; n_vectors];

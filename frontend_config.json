@@ -1,5 +1,5 @@
 {
-    "backend_url": "http://localhost:1707/",
-    "image_path": "http://localhost:7858/",
-    "thumb_path": "http://localhost:7857/"
+    "backend_url": "http://localhost:5601/",
+    "image_path": "",
+    "thumb_path": null
 }
