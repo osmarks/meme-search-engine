@@ -451,7 +451,7 @@ fn main() -> Result<()> {
             for (i, (x, _embedding)) in batch.into_iter().enumerate() {
                 let (vertices, shards) = read_out_vertices(count + i as u32)?; // TODO: could parallelize this given the batching
 
-                let mut entry_scores = scores[i..(i + score_model.output_channels)].to_vec();
+                let mut entry_scores = scores[(i * score_model.output_channels)..((i + 1) * score_model.output_channels)].to_vec();
 
                 entry_scores.push(x.timestamp as f32); // seconds since epoch, so precision issues aren't awful
 
