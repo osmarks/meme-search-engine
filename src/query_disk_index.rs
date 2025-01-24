@@ -471,6 +471,7 @@ impl hyper::service::Service<Request<Incoming>> for Service {
                     let query = query.iter().map(|x| half::f16::from_f32(*x)).collect::<Vec<f16>>();
 
                     let cmps_result = greedy_search(&mut scratch, selected_start, &query, &query_preprocessed, &descriptor_scales, index.clone(), false, beamwidth).await?;
+                    QUERIES_COUNTER.inc();
 
                     let n_visited = scratch.visited_list.len();
 
