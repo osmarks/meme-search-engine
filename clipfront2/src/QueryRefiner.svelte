@@ -36,26 +36,14 @@
 
     const d_emb = 1152
 
-    const vecSum = (xs, ys) => xs.map((x, i) => x + ys[i])
-    const vecZero = d => new Array(d).fill(0)
-    const vecScale = (xs, s) => xs.map(x => x * s)
-
-    const boxMuller = () => {
-        let x = Math.random()
-        let y = Math.random()
-        return Math.sqrt(-2.0 * Math.log(x)) * Math.cos(2.0 * Math.PI * y)
-    }
-
-    const randn = (d, sigma) => Array.from({ length: d }, () => boxMuller() * sigma)
-
     const K = 2
     let candidates = []
 
     const select = async candidate => {
         candidates = []
-        const direction = randn(d_emb, 1 / d_emb)
+        const direction = util.randn(d_emb, 1 / d_emb)
         for (let i = -K; i <= K; i++) {
-            const newV = vecSum(vecScale(direction, i / K), candidate.vector)
+            const newV = util.vecSum(util.vecScale(direction, i / K), candidate.vector)
             candidates.push({ vector: newV, results: null, i: i + K })
         }
         await Promise.all(candidates.map(async x => {
@@ -67,7 +55,7 @@
         console.log(candidates)
     }
 
-    select({ vector: randn(d_emb, 1 / d_emb) })
+    select({ vector: util.randn(d_emb, 1 / d_emb) })
 
     const handleKey = ev => {
         const num = parseInt(ev.key)

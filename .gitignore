@@ -22,3 +22,8 @@ index
 queries.txt
 *.zst
 .safetensors
+*/static/*.woff2
+flamegraph.svg
+*.jsonl
+*.safetensors
+perf.data

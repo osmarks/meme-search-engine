@@ -183,8 +183,8 @@ pub struct FrontendInit {
 pub type EmbeddingVector = Vec<f32>;
 
 #[derive(Debug, Serialize)]
-pub struct QueryResult {
-    pub matches: Vec<(f32, String, String, u64, Option<(u32, u32)>)>,
+pub struct QueryResult<T> {
+    pub matches: Vec<(f32, String, String, u64, Option<(u32, u32)>, Option<T>)>,
     pub formats: Vec<String>,
     pub extensions: HashMap<String, String>,
 }
@@ -203,7 +203,9 @@ pub struct QueryRequest {
     pub terms: Vec<QueryTerm>,
     pub k: Option<usize>,
     #[serde(default)]
-    pub include_video: bool
+    pub include_video: bool,
+    #[serde(default)]
+    pub debug_enabled: bool
 }
 
 lazy_static::lazy_static! {
@@ -238,8 +240,9 @@ pub async fn get_total_embedding<A: Future<Output = Result<Vec<Vec<u8>>>>, B: Fu
             }
         }
         if let Some(name) = &term.predefined_embedding {
-            let embedding = predefined_embeddings.get(name).context("name invalid")?;
-            total_embedding = total_embedding + embedding * term.weight.unwrap_or(1.0);
+            if let Some(embedding) = predefined_embeddings.get(name) {
+                total_embedding = total_embedding + embedding * term.weight.unwrap_or(1.0);
+            }
         }
     }
 

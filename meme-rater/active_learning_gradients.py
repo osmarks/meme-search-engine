@@ -13,14 +13,14 @@ import sys
 from model import Config, BradleyTerry
 import shared
 
-batch_size = 128
+batch_size = 32
 num_pairs = batch_size * 1024
 device = "cuda"
 
 config = Config(
     d_emb=1152,
     n_hidden=1,
-    n_ensemble=1,
+    n_ensemble=16,
     device=device,
     dtype=torch.float32,
     output_channels=3,
@@ -32,6 +32,7 @@ model.load_state_dict(torch.load(modelc))
 params = sum(p.numel() for p in model.parameters())
 print(f"{params/1e6:.1f}M parameters")
 print(model)
+model.eval()
 
 files = shared.fetch_all_files()
 importance = {}
@@ -41,8 +42,8 @@ buffers = {k: v.detach() for k, v in model.named_buffers()}
 
 # https://pytorch.org/tutorials/intermediate/per_sample_grads.html
 def compute_loss(params, buffers, sample, target):
-    batch = sample.unsqueeze(0)
-    targets = target.unsqueeze(0)
+    batch = sample.unsqueeze(1)
+    targets = target.unsqueeze(1).expand((config.n_ensemble, 1, config.output_channels))
 
     predictions = functional_call(model, (params, buffers), (batch,))
     loss = F.binary_cross_entropy(predictions, targets)
@@ -75,4 +76,4 @@ for bstart in tqdm(range(0, len(pairs), batch_size)):
 
 top = sorted(importance.items(), key=lambda x: -x[1])
 with open("top.json", "w") as f:
-    json.dump(top[:256], f)
+    json.dump(top[:50], f)

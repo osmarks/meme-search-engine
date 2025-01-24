@@ -6,9 +6,10 @@ import json
 import time
 from tqdm import tqdm
 from dataclasses import dataclass, asdict
+import math
 
 from model import SAEConfig, SAE
-from shared import train_split, loaded_arrays, ckpt_path
+from shared import train_split, loaded_arrays, ckpt_path, loaded_arrays_permutation
 
 device = "cuda"
 
@@ -24,7 +25,7 @@ class TrainConfig:
 config = TrainConfig(
     model=SAEConfig(
         d_emb=1152,
-        d_hidden=65536,
+        d_hidden=262144,
         top_k=128,
         device=device,
         dtype=torch.float32,
@@ -33,7 +34,7 @@ config = TrainConfig(
     lr=3e-4,
     weight_decay=0.0,
     batch_size=64,
-    epochs=5,
+    epochs=1,
     compile=True,
 )
 
@@ -81,7 +82,7 @@ with open(logfile, "w") as log:
         batch = []
         t = tqdm(range(0, int(len(loaded_arrays) * train_split), config.batch_size))
         for batch_start in t:
-            batch = numpy.stack([ numpy.frombuffer(embedding.as_py(), dtype=numpy.float16) for embedding in loaded_arrays["embedding"][batch_start:batch_start + config.batch_size] ])
+            batch = numpy.stack([ embedding for embedding in loaded_arrays[loaded_arrays_permutation[batch_start:batch_start + config.batch_size]] ])
 
             if len(batch) == config.batch_size:
                 batch = torch.Tensor(batch).to(device)

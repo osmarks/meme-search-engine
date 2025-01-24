@@ -31,6 +31,7 @@ model.load_state_dict(torch.load(modelc))
 params = sum(p.numel() for p in model.parameters())
 print(f"{params/1e6:.1f}M parameters")
 print(model)
+model.eval()
 
 files = shared.fetch_all_files()
 variance = {}
@@ -56,4 +57,4 @@ with torch.inference_mode():
 
 top = sorted(variance.items(), key=lambda x: -x[1])
 with open("top.json", "w") as f:
-    json.dump(top[:100], f)
+    json.dump(top[:50], f)

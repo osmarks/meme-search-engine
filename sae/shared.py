@@ -1,10 +1,10 @@
 import torch
-import pyarrow as pa
+import numpy as np
 
 torch.set_float32_matmul_precision("high")
 
-with pa.memory_map("../../sample_1m.arrow", "r") as source:
-    loaded_arrays = pa.ipc.open_file(source).read_all()
+loaded_arrays = np.memmap("embeddings.bin", dtype=np.float16).reshape(-1, 1152)
+loaded_arrays_permutation = np.random.permutation(len(loaded_arrays))
 
 train_split = 0.8
 

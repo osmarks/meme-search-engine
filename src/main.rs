@@ -892,7 +892,7 @@ async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
 }
 
 #[instrument(skip(index))]
-async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bool) -> Result<QueryResult> {
+async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bool) -> Result<QueryResult<()>> {
     let result = index.vectors.search(&query, k as usize)?;
 
     let mut seen_videos = HashSet::new();
@@ -916,7 +916,8 @@ async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bo
                 index.filenames[id].container_filename(),
                 generate_filename_hash(&index.filenames[id as usize]).clone(),
                 index.format_codes[id],
-                index.metadata[id].as_ref().map(|x| (x.width, x.height))
+                index.metadata[id].as_ref().map(|x| (x.width, x.height)),
+                Option::<()>::None
             ))
         })
         .collect();

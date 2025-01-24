@@ -10,14 +10,16 @@ with open("mse_config.json") as f:
 def get_embedding(req):
     return msgpack.unpackb(requests.post(config["clip_server"], data=msgpack.packb(req)).content)
 
-output, input, *xs = sys.argv[1:]
+mode, output, input = sys.argv[1:]
 
 with open(output, "wb") as f:
-    with open(input, "rb") as g:
-        input_data = g.read()
-    if not xs:
+    if mode == "image":
+        with open(input, "rb") as g:
+            input_data = g.read()
         result = get_embedding({"images": [input_data]})[0]
+    elif mode == "text":
+        result = get_embedding({"text": input})[0]
     else:
-        result = get_embedding({"text": xs})[0]
+        raise Exception("unknown mode")
     f.write(result)
     print(base64.urlsafe_b64encode(result).decode("ascii"))

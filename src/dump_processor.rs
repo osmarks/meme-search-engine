@@ -69,6 +69,10 @@ struct CLIArguments {
     gpu: Option<usize>,
     #[argh(option, description="descriptor CDFs")]
     cdfs: Option<String>,
+    #[argh(option, description="postfilter by embedding (late discard if dot product above threshold)")]
+    postfilter: Vec<String>,
+    #[argh(option, description="postfilter by scorer")]
+    postfilter_scorer: Vec<String>,
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -162,9 +166,21 @@ fn main() -> Result<()> {
         } else {
             (snd, None)
         };
+        let mut post_threshold = None;
+        for x in &args.postfilter {
+            let (tname, snd) = x.split_once(':').context("invalid postfilter argument")?;
+            if tname == name {
+                post_threshold = Some(snd.parse::<f32>().context("parse postfilter threshold")?);
+            }
+        }
         let blob = fs::read(path).context("read embedding")?;
-        embeddings.push((name.to_string(), common::decode_fp16_buffer(&blob), Histogram::new(-1.0, 1.0, 512), threshold));
+        embeddings.push((name.to_string(), common::decode_fp16_buffer(&blob), Histogram::new(-1.0, 1.0, 512), threshold, post_threshold));
     }
+
+    let postfilter_scorer = args.postfilter_scorer.iter().map(|x| {
+        let (id, snd) = x.split_once(':').context("invalid postfilter scorer argument")?;
+        Ok((id.parse::<usize>().context("invalid postfilter scorer id")?, snd.parse::<f32>().context("parse postfilter scorer threshold")?))
+    }).collect::<Result<Vec<_>>>()?;
 
     let pq_codec = if let Some(pq_codec) = args.pq_codec {
         let data = fs::read(pq_codec).context("read pq codec")?;
@@ -255,7 +271,6 @@ fn main() -> Result<()> {
         files.sort_by_key(|(id, _)| *id);
         shard_id_mappings.sort_by_key(|(id, _)| *id);
 
-
         let read_out_vertices = move |id: u32| -> Result<(Vec<u32>, Vec<u32>)> {
             let mut out_vertices: Vec<u32> = vec![];
             let mut shards: Vec<u32> = vec![];
@@ -323,6 +338,8 @@ fn main() -> Result<()> {
 
     let th = std::thread::spawn(move || reader_thread(&args.paths, tx));
 
+    let mut postfilter_count = 0;
+
     let mut rng2 = rng.fork();
     let initial_filter = |x: ProcessedEntry| {
         i += 1;
@@ -337,12 +354,20 @@ fn main() -> Result<()> {
         latest_timestamp = latest_timestamp.max(timestamp);
         earliest_timestamp = earliest_timestamp.min(timestamp);
 
-        for (_name, vec, histogram, threshold) in &mut embeddings {
+        let mut postfilter = false;
+
+        for (_name, vec, histogram, threshold, postfilter_threshold) in &mut embeddings {
             let dot = SpatialSimilarity::dot(&embedding, vec).unwrap() as f32;
             histogram.add(dot);
             if let Some(threshold) = threshold {
                 if dot >= *threshold {
                     return None;
+                }
+            }
+            if let Some(threshold) = postfilter_threshold {
+                if dot >= *threshold {
+                    postfilter = true;
+                    postfilter_count += 1; // somewhat wrong because could be duplicated
                 }
             }
         }
@@ -393,7 +418,7 @@ fn main() -> Result<()> {
             println!("{}", data);
         }
 
-        Some((x, embedding))
+        Some((x, embedding, postfilter))
     };
 
     let mut dead_count = 0;
@@ -404,14 +429,14 @@ fn main() -> Result<()> {
         let batch: Vec<_> = batch.collect();
         let batch_len = batch.len();
 
-        for (x, _embedding) in batch.iter() {
+        for (x, _embedding, _postfilter) in batch.iter() {
             if let Some(ref mut file) = output_file {
                 file.write_all(&x.embedding)?;
             }
         }
 
         if let Some(shards) = &mut shards_out {
-            for (i, (x, embedding)) in batch.iter().enumerate() {
+            for (i, (x, embedding, _postfilter)) in batch.iter().enumerate() {
                 // closest matches first
                 shards.sort_by_cached_key(|&(ref centroid, _, shard_count, _shard_index)| {
                     let mut dot = SpatialSimilarity::dot(&centroid, &embedding).unwrap();
@@ -439,7 +464,7 @@ fn main() -> Result<()> {
             let quantizer = pq_codec.as_ref().context("PQ codec needed to output index")?;
 
             let mut batch_embeddings = Vec::with_capacity(batch.len() * D_EMB as usize);
-            for (_x, embedding) in batch.iter() {
+            for (_x, embedding, _postfilter) in batch.iter() {
                 batch_embeddings.extend_from_slice(&embedding);
             }
             let codes = quantizer.quantize_batch(&batch_embeddings);
@@ -448,7 +473,7 @@ fn main() -> Result<()> {
             let cdfs = cdfs.as_ref().context("score model CDFs needed to output index")?;
             let scores = score_model.score_batch(&batch_embeddings)?;
 
-            for (i, (x, _embedding)) in batch.into_iter().enumerate() {
+            for (i, (x, _embedding, mut postfilter)) in batch.into_iter().enumerate() {
                 let (vertices, shards) = read_out_vertices(count + i as u32)?; // TODO: could parallelize this given the batching
 
                 let mut entry_scores = scores[(i * score_model.output_channels)..((i + 1) * score_model.output_channels)].to_vec();
@@ -465,6 +490,13 @@ fn main() -> Result<()> {
                     index_output_file.2.write_all(&[cdf_bucket])?;
                 }
 
+                for (index, score) in postfilter_scorer.iter() {
+                    if entry_scores[*index] < *score {
+                        postfilter = true;
+                        break;
+                    }
+                }
+
                 let mut entry = PackedIndexEntry {
                     id: count + i as u32,
                     vertices,
@@ -476,9 +508,10 @@ fn main() -> Result<()> {
                     shards
                 };
                 let mut bytes = bitcode::encode(&entry);
-                if bytes.len() > (RECORD_PAD_SIZE - 2) {
+                // as an ugly hack for removing entries already in the index shards, kill the URL and make it a graph node only
+                if bytes.len() > (RECORD_PAD_SIZE - 2) || postfilter {
                     // we do need the records to fit in a fixed size and can't really drop things, so discard URL so it can exist as a graph node only
-                    entry.url = String::new();
+                    entry.url = String::new(); // URL is only input-controlled, arbitrary-length field
                     bytes = bitcode::encode(&entry);
                     dead_count += 1;
                 }
@@ -494,11 +527,11 @@ fn main() -> Result<()> {
     }
 
     if args.print_aggregates {
-        println!("earliest={} latest={} count={} read={} deduped={}", earliest_timestamp, latest_timestamp, count, i, deduped_count);
+        println!("earliest={} latest={} count={} read={} deduped={} postfiltered={}", earliest_timestamp, latest_timestamp, count, i, deduped_count, postfilter_count);
     }
     if let Some(histogram_path) = args.histograms {
         let mut file = fs::File::create(histogram_path)?;
-        for (name, _, histogram, _) in &embeddings {
+        for (name, _, histogram, _, _) in &embeddings {
             let width = 800.0;
             let padding = 40.0;
             let bars_height = 300 as f64;

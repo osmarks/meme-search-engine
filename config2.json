@@ -1,0 +1,10 @@
+{
+    "listen_address": "127.0.0.1:5601",
+    "clip_server": "http://100.64.0.10:1708",
+    "descriptor_names": [
+        "Useful",
+        "Meme",
+        "Aesthetic",
+        "Time"
+    ]
+}

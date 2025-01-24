@@ -1,8 +1,12 @@
 {
-    "backend_url": "http://localhost:5601/",
+    "backend_url": "/backend",
     "image_path": "",
     "thumb_path": null,
     "description": "Organizing the world's memes.",
     "name": "Nooscope",
-    "telemetry_endpoint": "/telemetry"
+    "telemetry_endpoint": "/telemetry",
+    "friendly_mode_default_terms": [
+        { "predefined_embedding": "Meme", "weight": 1, "sign": "+" },
+        { "predefined_embedding": "Aesthetic", "weight": 0.2, "sign": "+" }
+    ]
 }

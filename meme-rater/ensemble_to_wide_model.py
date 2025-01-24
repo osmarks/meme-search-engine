@@ -31,6 +31,11 @@ params = sum(p.numel() for p in model.parameters())
 print(f"{params/1e6:.1f}M parameters")
 print(model)
 
+torch.random.manual_seed(1)
+
+for x in model.ensemble.models:
+    x.output.bias.data.fill_(0)
+
 out_layers = []
 out_bias = []
 
@@ -50,7 +55,7 @@ with torch.inference_mode():
         downprojection[:, i*config.d_emb:(i+1)*config.d_emb] = model.ensemble.models[i].output.weight.data.clone()
 
     for i in range(10):
-        input = torch.randn(3, config.d_emb)
+        input = torch.randn(4, config.d_emb)
         ground_truth_result = model.ensemble(input.unsqueeze(0).expand((config.n_ensemble, *input.shape))).mean(dim=0).T
         r_result = input
         for (layer, bias) in zip(out_layers, out_bias):
@@ -58,13 +63,14 @@ with torch.inference_mode():
             print(r_result.shape, bias.shape)
             r_result = F.silu(r_result)
         r_result = torch.matmul(downprojection, r_result) / config.n_ensemble
-        bias_diff = torch.mean(r_result - ground_truth_result)
-        model_issue_diff = torch.max(torch.abs(r_result - bias_diff - ground_truth_result))
-        print(model_issue_diff)
+        error = torch.mean(r_result - ground_truth_result)
+        print(error)
+        assert error.detach().cpu().numpy() < 1e-4
 
         print("test vector:")
-        print(input.flatten().tolist())
+        #print(input.flatten().tolist())
         print("ground truth result:")
+        print(ground_truth_result.shape)
         print(ground_truth_result.T.flatten().tolist())
 
     save_file({

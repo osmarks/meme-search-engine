@@ -45,7 +45,7 @@ impl Vector {
 }
 
 // Floats are vaguely annoying and not sortable (trivially), so we mostly represent dot products as integers
-pub const SCALE: f32 = 1099511627776.0;
+pub const SCALE: f32 = 4294967296.0;
 pub const SCALE_F64: f64 = SCALE as f64;
 
 pub fn dot<'a>(x: VectorRef<'a>, y: VectorRef<'a>) -> i64 {

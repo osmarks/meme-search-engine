@@ -35,7 +35,7 @@ class Ensemble(nn.Module):
 
     # model batch
     def forward(self, embs):
-        return torch.stack([ x(embs[i]) for i, x in enumerate(self.models) ]) # model batch output_dim=1
+        return torch.stack([ x(embs[i]) for i, x in enumerate(self.models) ]) # model batch output_channels
 
 class BradleyTerry(nn.Module):
     def __init__(self, config):

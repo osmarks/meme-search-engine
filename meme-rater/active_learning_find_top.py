@@ -52,7 +52,7 @@ channel = int(sys.argv[2])
 percentile = float(sys.argv[3])
 output_pairs = int(sys.argv[4])
 mean_scores = numpy.mean(numpy.stack([score for filename, score in results.items()]))
-top = sorted(((filename, score) for filename, score in results.items() if (score > mean_scores).all()), key=lambda x: x[1][channel], reverse=True)
+top = sorted(((filename, score) for filename, score in results.items()), key=lambda x: x[1][channel], reverse=True)
 select_from = top[:int(len(top) * percentile)]
 
 out = []

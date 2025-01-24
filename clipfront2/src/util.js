@@ -78,3 +78,15 @@ fetch(config.backend_url).then(x => x.json().then(x => {
     serverConfig.set(x)
     window.serverConfig = x
 }))
+
+export const vecSum = (xs, ys) => xs.map((x, i) => x + ys[i])
+export const vecZero = d => new Array(d).fill(0)
+export const vecScale = (xs, s) => xs.map(x => x * s)
+
+const boxMuller = () => {
+    let x = Math.random()
+    let y = Math.random()
+    return Math.sqrt(-2.0 * Math.log(x)) * Math.cos(2.0 * Math.PI * y)
+}
+
+export const randn = (d, sigma) => Array.from({ length: d }, () => boxMuller() * sigma)

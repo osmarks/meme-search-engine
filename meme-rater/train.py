@@ -9,11 +9,12 @@ import time
 from tqdm import tqdm
 import math
 from dataclasses import dataclass, asdict
+import sys
 
 from model import Config as ModelConfig, BradleyTerry
 import shared
 
-trains, validations = shared.fetch_ratings()
+trains, validations = shared.fetch_ratings(sys.argv[1:])
 for train, validation in zip(trains, validations):
     print(len(train), len(validation))
 
@@ -36,11 +37,11 @@ config = TrainConfig(
         n_ensemble=16,
         device=device,
         dtype=torch.float32,
-        dropout=0.1,
+        dropout=0.0,
         output_channels=3
     ),
     lr=3e-4,
-    weight_decay=0.2,
+    weight_decay=0.0,
     batch_size=1,
     epochs=5,
     compile=False,

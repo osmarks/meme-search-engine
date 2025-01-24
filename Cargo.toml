@@ -62,6 +62,8 @@ monoio = "0.2"
 hyper = "1"
 monoio-compat = { version = "0.2", features = ["hyper"] }
 http-body-util = "0.1"
+matrixmultiply = "0.3"
+bitvec = "1"
 
 [[bin]]
 name = "reddit-dump"

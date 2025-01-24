@@ -154,7 +154,6 @@
     <div class="right">
         <NavItem page="advanced">Advanced</NavItem>
         <NavItem page="about">About</NavItem>
-        <NavItem page="refine">Refine</NavItem>
     </div>
 </nav>
 
@@ -185,7 +184,11 @@
                             <option>+</option>
                             <option>-</option>
                         </select>
-                        <input type="range" min="0" max="2" bind:value={term.weight} step="0.01">
+                        {#if debugEnabled}
+                            <input type="number" bind:value={term.weight} step="0.01">
+                        {:else}
+                            <input type="range" min="0" max="2" bind:value={term.weight} step="0.01">
+                        {/if}
                         {#if term.type === "image"}
                             <span>{term.file.name}</span>
                         {:else if term.type === "text"}
@@ -200,6 +203,14 @@
                     </li>
                 {/each}
             </ul>
+            {#if showDebugSwitch}
+            <div class="ctrlbar">
+                <input type="checkbox" bind:checked={debugEnabled} id="debug" />
+                <label for="debug">Debug</label>
+                {#if debugEnabled}
+                {/if}
+            </div>
+            {/if}
             <div class="ctrlbar">
                 <input type="search" placeholder="Text Query" on:keydown={handleKey} on:focus={newTextQuery}>
                 <button on:click={pickFile}>Image Query</button>
@@ -242,6 +253,9 @@
     let queryCounter = 0
     let config = {}
 
+    const showDebugSwitch = localStorage.getItem("debugEnabled") === "true"
+    let debugEnabled = false
+
     const newTextQuery = (content=null) => {
         queryTerms.push({ type: "text", weight: 1, sign: "+", text: typeof content === "string" ? content : "" })
         queryTerms = queryTerms
@@ -253,9 +267,14 @@
 
     const runSearch = async () => {
         if (!resultPromise) {
+            const friendlyModeQueryOrRandom = friendlyModeQuery ? [{ text: friendlyModeQuery, weight: 1, sign: "+" }] : [{ embedding: util.randn(config.d_emb, 1 / (config.d_emb ** 0.5)), weight: 1, sign: "+" }]
+            const terms = friendlyMode ?
+                friendlyModeQueryOrRandom.concat(util.hardConfig.friendly_mode_default_terms ?? []) :
+                queryTerms.filter(x => x.text !== "").map(x => ({ image: x.imageData, text: x.text, embedding: x.embedding, predefined_embedding: x.predefinedEmbedding, weight: x.weight * { "+": 1, "-": -1 }[x.sign] }))
             let args = {
-                "terms": friendlyMode ? [{ text: friendlyModeQuery, weight: 1, sign: "+" }] : queryTerms.filter(x => x.text !== "").map(x => ({ image: x.imageData, text: x.text, embedding: x.embedding, predefined_embedding: x.predefinedEmbedding, weight: x.weight * { "+": 1, "-": -1 }[x.sign] })),
-                "include_video": true
+                "terms": terms,
+                "include_video": true,
+                "debug_enabled": debugEnabled
             }
 
             util.sendTelemetry("search", {
@@ -314,7 +333,7 @@
                 type: "predefined_embedding",
                 predefinedEmbedding: predefinedEmbeddingName,
                 sign: "+",
-                weight: 0.2
+                weight: 1
             })
         }
         queryTerms = queryTerms

@@ -51,19 +51,25 @@ async def index(request):
         <form action="/rate" method="POST">
             <table>
             <tr>
+            <td><input type="radio" name="rating-useful" value="1+" id="rq1p"> <label for="rq1p">LHS is much better (useful)</label></td>
             <td><input type="radio" name="rating-useful" value="1" id="rq1"> <label for="rq1">LHS is better (useful)</label></td>
             <td><input type="radio" name="rating-useful" value="eq" id="rqe"> <label for="rqe">Tie</label></td>
             <td><input type="radio" name="rating-useful" value="2" id="rq2"> <label for="rq2">RHS is better (useful)</label></td>
+            <td><input type="radio" name="rating-useful" value="2+" id="rq2p"> <label for="rq2p">LHS is much better (useful)</label></td>
             </tr>
             <tr>
+            <td><input type="radio" name="rating-meme" value="1+" id="rm1p"> <label for="rm1p">LHS is much better (memetically)</label></td>
             <td><input type="radio" name="rating-meme" value="1" id="rm1"> <label for="rm1">LHS is better (memetically)</label></td>
             <td><input type="radio" name="rating-meme" value="eq" id="rme"> <label for="rme">Tie</label></td>
             <td><input type="radio" name="rating-meme" value="2" id="rm2"> <label for="rm2">RHS is better (memetically)</label></td>
+            <td><input type="radio" name="rating-meme" value="2+" id="rm2p"> <label for="rm2p">LHS is much better (memetically)</label></td>
             </tr>
             <tr>
+            <td><input type="radio" name="rating-aesthetic" value="1+" id="ra1p"> <label for="ra1p">LHS is much better (aesthetically)</label></td>
             <td><input type="radio" name="rating-aesthetic" value="1" id="ra1"> <label for="ra1">LHS is better (aesthetically)</label></td>
             <td><input type="radio" name="rating-aesthetic" value="eq" id="rae"> <label for="rae">Tie</label></td>
             <td><input type="radio" name="rating-aesthetic" value="2" id="ra2"> <label for="ra2">RHS is better (aesthetically)</label></td>
+            <td><input type="radio" name="rating-aesthetic" value="2+" id="ra2p"> <label for="ra2p">LHS is much better (aesthetically)</label></td>
             </td>
             </table>
 
@@ -82,35 +88,29 @@ async def index(request):
                     document.querySelector("form").submit()
                 }}
             }}
+            const keys = {{
+                "q": "rq1p",
+                "w": "rq1",
+                "e": "rqe",
+                "r": "rq2",
+                "t": "rq2p",
+                "a": "rm1p",
+                "s": "rm1",
+                "d": "rme",
+                "f": "rm2",
+                "g": "rm2p",
+                "z": "ra1p",
+                "x": "ra1",
+                "c": "rae",
+                "v": "ra2",
+                "b": "ra2p",
+            }}
             document.addEventListener("keypress", function(event) {{
-                if (event.key === "q") {{
-                    document.querySelector("input[name='rating-useful'][value='1']").checked = true
-                    commitIfReady()
-                }} else if (event.key === "w") {{
-                    document.querySelector("input[name='rating-useful'][value='eq']").checked = true
-                    commitIfReady()
-                }} else if (event.key === "e") {{
-                    document.querySelector("input[name='rating-useful'][value='2']").checked = true
-                    commitIfReady()
-                }} else if (event.key === "a") {{
-                    document.querySelector("input[name='rating-meme'][value='1']").checked = true
-                    commitIfReady()
-                }} else if (event.key === "s") {{
-                    document.querySelector("input[name='rating-meme'][value='eq']").checked = true
-                    commitIfReady()
-                }} else if (event.key === "d") {{
-                    document.querySelector("input[name='rating-meme'][value='2']").checked = true
-                    commitIfReady()
-                }} else if (event.key === "z") {{
-                    document.querySelector("input[name='rating-aesthetic'][value='1']").checked = true
-                    commitIfReady()
-                }} else if (event.key === "x") {{
-                    document.querySelector("input[name='rating-aesthetic'][value='eq']").checked = true
-                    commitIfReady()
-                }} else if (event.key === "c") {{
-                    document.querySelector("input[name='rating-aesthetic'][value='2']").checked = true
-                    commitIfReady()
+                const key = keys[event.key]
+                if (key) {{
+                    document.getElementById(key).checked = true
                 }}
+                commitIfReady()
             }});
         </script>
     </body>

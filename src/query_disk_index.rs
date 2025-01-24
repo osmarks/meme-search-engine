@@ -7,7 +7,7 @@ use argh::FromArgs;
 use itertools::Itertools;
 use foldhash::{HashSet, HashSetExt};
 use half::f16;
-use diskann::{NeighbourBuffer, vector::{fast_dot_noprefetch, QueryLUT, scale_dot_result, scale_dot_result_f64}};
+use diskann::{NeighbourBuffer, vector::{fast_dot_noprefetch, QueryLUT, scale_dot_result, scale_dot_result_f64, SCALE_F64}};
 use simsimd::SpatialSimilarity;
 use memmap2::{Mmap, MmapOptions};
 use std::rc::Rc;
@@ -18,13 +18,14 @@ use http_body_util::{BodyExt, Empty, Full};
 use prometheus::{register_int_counter, register_int_counter_vec, register_int_gauge, Encoder, IntCounter, IntGauge, IntCounterVec};
 use std::pin::Pin;
 use std::future::Future;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use std::str::FromStr;
 use std::collections::HashMap;
+use std::io::Write;
 
 mod common;
 
-use common::{resize_for_embed_sync, FrontendInit, IndexHeader, InferenceServerConfig, PackedIndexEntry, QueryRequest, QueryResult};
+use common::{resize_for_embed_sync, QueryTerm, FrontendInit, IndexHeader, InferenceServerConfig, PackedIndexEntry, QueryRequest, QueryResult};
 
 #[derive(FromArgs, Clone)]
 #[argh(description="Query disk index")]
@@ -43,10 +44,18 @@ struct CLIArguments {
     search_list_size: Option<usize>,
     #[argh(switch, description="always use full-precision vectors (slow)")]
     disable_pq: bool,
-    #[argh(option, short='l', description="listen address")]
-    listen_address: Option<String>,
-    #[argh(option, short='c', description="clip server")]
-    clip_server: Option<String>,
+    #[argh(option, short='c', description="server config file")]
+    config_path: Option<String>
+}
+
+#[derive(Deserialize, Clone)]
+struct ServerConfig {
+    listen_address: String,
+    clip_server: String,
+    descriptor_names: Vec<String>,
+    telemetry_file: String,
+    search_list: usize,
+    beam_width: usize
 }
 
 lazy_static! {
@@ -82,9 +91,21 @@ fn next_several_unvisited(s: &mut NeighbourBuffer, n: usize) -> Option<Vec<u32>>
     }
 }
 
+const DUPLICATES_THRESHOLD: f32 = 0.95;
+
 fn read_pq_codes(id: u32, index: Rc<Index>, buf: &mut Vec<u8>) {
     let loc = (id as usize) * index.pq_code_size;
     buf.extend(&index.pq_codes[loc..loc+index.pq_code_size])
+}
+
+struct VisitedNode {
+    image_url: String,
+    scores: Vec<f32>,
+    shards: Vec<u32>,
+    id: u32,
+    score: i64,
+    timestamp: u64,
+    dimensions: (u32, u32)
 }
 
 struct Scratch {
@@ -92,7 +113,8 @@ struct Scratch {
     visited: HashSet<u32>,
     neighbour_buffer: NeighbourBuffer,
     neighbour_pre_buffer: Vec<u32>,
-    visited_list: Vec<(u32, i64, String, Vec<u32>, Vec<f32>)>
+    visited_list: Vec<VisitedNode>,
+    visited_embeddings: Vec<f32>
 }
 
 struct Index {
@@ -140,10 +162,20 @@ async fn greedy_search<'a>(scratch: &mut Scratch, start: u32, query: &[f16], que
             let index = index.clone();
             let node = handle.await?;
             let vector = bytemuck::cast_slice(&node.vector);
-            let distance = fast_dot_noprefetch(query, &vector);
+            let mut score = fast_dot_noprefetch(query, &vector);
+            score += descriptor_product(index.clone(), &descriptor_scales, node.id);
             cmps += 1;
-            if scratch.visited.insert(node.id) {
-                scratch.visited_list.push((node.id, distance, node.url, node.shards, node.scores));
+            if scratch.visited.insert(node.id) && node.url.len() > 0 {
+                scratch.visited_list.push(VisitedNode {
+                    image_url: node.url,
+                    scores: node.scores,
+                    shards: node.shards,
+                    id: node.id,
+                    score,
+                    timestamp: node.timestamp,
+                    dimensions: node.dimensions
+                });
+                scratch.visited_embeddings.extend(bytemuck::cast_slice(&node.vector).iter().map(|x: &f16| x.to_f32()));
             };
             for &neighbour in node.vertices.iter() {
                 if scratch.visited_adjacent.insert(neighbour) {
@@ -250,7 +282,8 @@ async fn evaluate(args: &CLIArguments, index: Rc<Index>) -> Result<()> {
                 neighbour_buffer: NeighbourBuffer::new(args.search_list_size.unwrap_or(1000)),
                 neighbour_pre_buffer: Vec::new(),
                 visited_list: Vec::new(),
-                visited_adjacent: HashSet::new()
+                visited_adjacent: HashSet::new(),
+                visited_embeddings: Vec::new()
             };
 
             let descriptor_scales = DescriptorScales(vec![0.0, 0.0, 0.0, 0.0]);
@@ -265,14 +298,14 @@ async fn evaluate(args: &CLIArguments, index: Rc<Index>) -> Result<()> {
                 println!("index scan {}: {:?} cmps", shard, cmps_result);
             }
 
-            scratch.visited_list.sort_by_key(|x| -x.1);
-            for (i, (id, distance, url, shards, scores)) in scratch.visited_list.iter().take(20).enumerate() {
-                let found_id = match matches.binary_search(&(*id, 0)) {
+            scratch.visited_list.sort_by_key(|x| -x.score);
+            for (i, node) in scratch.visited_list.iter().take(20).enumerate() {
+                let found_id = match matches.binary_search(&(node.id, 0)) {
                     Ok(pos) => pos,
                     Err(pos) => pos
                 };
                 if args.verbose {
-                    println!("index scan: {} {} {} {:?} {:?}; rank {}", id, distance, url, shards, scores, matches[found_id].1 + 1);
+                    println!("index scan: {} {} {} {:?} {:?}; rank {}", node.id, node.score, node.image_url, node.shards, node.scores, matches[found_id].1 + 1);
                 };
                 top_ranks[i] = std::cmp::min(top_ranks[i], matches[found_id].1);
             }
@@ -341,11 +374,23 @@ pub async fn query_clip_server<I, O>(base_url: &str, path: &str, data: Option<I>
     Ok(result)
 }
 
+#[derive(Serialize, Deserialize)]
+struct TelemetryMessage {
+    #[serde(rename="correlationId")]
+    correlation_id: String,
+    data: serde_json::Value,
+    event: String,
+    #[serde(rename="instanceId")]
+    instance_id: String,
+    page: String
+}
+
 #[derive(Clone)]
 struct Service {
     index: Rc<Index>,
     inference_server_config: Rc<InferenceServerConfig>,
-    args: Rc<CLIArguments>
+    config: Rc<ServerConfig>,
+    telemetry_channel: std::sync::mpsc::Sender<TelemetryMessage>
 }
 
 impl hyper::service::Service<Request<Incoming>> for Service {
@@ -355,15 +400,16 @@ impl hyper::service::Service<Request<Incoming>> for Service {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let index = self.index.clone();
-        let args = self.args.clone();
+        let config = self.config.clone();
         let inference_server_config = self.inference_server_config.clone();
+        let channel = self.telemetry_channel.clone();
 
         Box::pin(async move {
             let mut body = match (req.method(), req.uri().path()) {
                 (&Method::GET, "/") => Response::new(Full::new(Bytes::from(serde_json::to_vec(&FrontendInit {
                     n_total: (index.header.count - index.header.dead_count) as u64,
                     d_emb: index.header.quantizer.n_dims,
-                    predefined_embedding_names: vec![]
+                    predefined_embedding_names: config.descriptor_names.clone()
                 })?))),
                 (&Method::POST, "/") => {
                     let upper = req.body().size_hint().upper().unwrap_or(u64::MAX);
@@ -381,7 +427,7 @@ impl hyper::service::Service<Request<Incoming>> for Service {
                         &body.terms,
                         &*inference_server_config,
                         |batch, _config| {
-                            query_clip_server(args.clip_server.as_ref().unwrap(), "/", Some(batch))
+                            query_clip_server(config.clip_server.as_str(), "/", Some(batch))
                         },
                         |image, config| async move {
                             let image = image::load_from_memory(&image)?;
@@ -397,27 +443,89 @@ impl hyper::service::Service<Request<Incoming>> for Service {
                     }).unwrap();
                     let selected_start = index.header.shards[selected_shard].1;
 
-                    let beamwidth = 3;
+                    let beamwidth = config.beam_width;
 
                     let mut scratch = Scratch {
                         visited: HashSet::new(),
-                        neighbour_buffer: NeighbourBuffer::new(args.search_list_size.unwrap_or(1000)),
+                        neighbour_buffer: NeighbourBuffer::new(config.search_list),
                         neighbour_pre_buffer: Vec::new(),
                         visited_list: Vec::new(),
-                        visited_adjacent: HashSet::new()
+                        visited_adjacent: HashSet::new(),
+                        visited_embeddings: Vec::new()
                     };
 
-                    let descriptor_scales = DescriptorScales(vec![0.0, 0.0, 0.0, 0.0]);
+                    let mut desc = vec![0.0, 0.0, 0.0, 0.0];
+
+                    for term in &body.terms {
+                        if let Some(name) = &term.predefined_embedding {
+                            if let Some(index) = config.descriptor_names.iter().position(|x| x == name) {
+                                desc[index] = term.weight.unwrap_or(1.0) * 1.0/512.0;
+                            }
+                        }
+                    }
+
+                    let descriptor_scales = DescriptorScales(desc);
 
                     let query_preprocessed = index.header.quantizer.preprocess_query(&query);
 
                     let query = query.iter().map(|x| half::f16::from_f32(*x)).collect::<Vec<f16>>();
 
-                    let cmps_result = greedy_search(&mut scratch, selected_start, &query, &query_preprocessed, &descriptor_scales, index.clone(), args.disable_pq, beamwidth).await?;
+                    let cmps_result = greedy_search(&mut scratch, selected_start, &query, &query_preprocessed, &descriptor_scales, index.clone(), false, beamwidth).await?;
 
-                    scratch.visited_list.sort_by_key(|x| -x.1);
+                    let n_visited = scratch.visited_list.len();
 
-                    let matches = scratch.visited_list.drain(..).map(|(id, score, url, shards, scores)| (score as f32, url, String::new(), 0, None)).collect::<Vec<_>>();
+                    let mut similarities_against_self = vec![0.0f32; n_visited * n_visited];
+
+                    // runtime deduplicate of results list
+                    unsafe {
+                        // vecs @ vecs.T
+                        matrixmultiply::sgemm(
+                            n_visited,
+                            index.header.quantizer.n_dims,
+                            n_visited,
+                            1.0,
+                            scratch.visited_embeddings.as_ptr(),
+                            index.header.quantizer.n_dims as isize,
+                            1,
+                            scratch.visited_embeddings.as_ptr(),
+                            1,
+                            index.header.quantizer.n_dims as isize,
+                            0.0,
+                            similarities_against_self.as_mut_ptr(),
+                            n_visited as isize,
+                            1
+                        );
+                    }
+
+                    // discard anything similar to something already in list
+                    let mut i = 0;
+                    let mut included = bitvec::bitvec![0; n_visited];
+                    scratch.visited_list.retain(|_node| {
+                        let row = &similarities_against_self[(i * n_visited)..((i + 1) * n_visited)];
+                        let old_i = i;
+                        i += 1;
+                        for (other_i, similarity) in row.iter().enumerate() {
+                            if similarity > &DUPLICATES_THRESHOLD && included[other_i] {
+                                return false;
+                            }
+                        }
+                        included.set(old_i, true);
+                        true
+                    });
+
+                    scratch.visited_list.sort_unstable_by_key(|x| -x.score);
+
+                    let matches = scratch.visited_list
+                        .drain(..)
+                        .map(|node| {
+                            let debug = if body.debug_enabled {
+                                Some((node.scores, node.shards, node.timestamp))
+                            } else {
+                                None
+                            };
+                            ((node.score as f64 / SCALE_F64) as f32, node.image_url, String::new(), 0, Some(node.dimensions), debug)
+                        })
+                        .collect::<Vec<_>>();
 
                     let result = QueryResult {
                         formats: vec![],
@@ -438,6 +546,25 @@ impl hyper::service::Service<Request<Incoming>> for Service {
                         .header(hyper::header::CONTENT_TYPE, "text/plain; version=0.0.4")
                         .body(Full::new(Bytes::from(buffer))).unwrap()
                 },
+                (&Method::POST, "/telemetry") => {
+                    // TODO refactor
+                    let upper = req.body().size_hint().upper().unwrap_or(u64::MAX);
+                    if upper > 1000 {
+                        let mut resp = Response::new(Full::new(Bytes::from("Body too big")));
+                        *resp.status_mut() = hyper::StatusCode::PAYLOAD_TOO_LARGE;
+                        return Ok(resp);
+                    }
+
+                    let whole_body = req.collect().await?.to_bytes();
+
+                    let message = serde_json::from_slice::<TelemetryMessage>(&whole_body)?;
+
+                    channel.send(message)?;
+
+                    Response::builder()
+                        .status(StatusCode::NO_CONTENT)
+                        .body(Full::new(Bytes::from(""))).unwrap()
+                }
                 (&Method::OPTIONS, "/") => {
                     Response::builder()
                         .status(StatusCode::NO_CONTENT)
@@ -459,9 +586,9 @@ impl hyper::service::Service<Request<Incoming>> for Service {
     }
 }
 
-async fn get_backend_config(clip_server: &Option<String>) -> Result<InferenceServerConfig> {
+async fn get_backend_config(clip_server: &String) -> Result<InferenceServerConfig> {
     loop {
-        match query_clip_server(clip_server.as_ref().unwrap(), "/config", Option::<()>::None).await {
+        match query_clip_server(clip_server, "/config", Option::<()>::None).await {
             Ok(config) => return Ok(config),
             Err(err) => {
                 tracing::warn!("waiting for clip server: {}", err);
@@ -471,14 +598,31 @@ async fn get_backend_config(clip_server: &Option<String>) -> Result<InferenceSer
     }
 }
 
+// can't run this as an async task because monoio File API is positional writes only
+fn telemetry_handler(rx: std::sync::mpsc::Receiver<TelemetryMessage>, config: ServerConfig) -> Result<()> {
+    let mut telemetry_file = std::fs::OpenOptions::new().create(true).create(true).append(true).open(&config.telemetry_file)?;
+    while let Ok(message) = rx.recv() {
+        telemetry_file.write_all(rmp_serde::to_vec(&message)?.as_slice())?;
+    }
+    Ok(())
+}
+
 async fn serve(args: &CLIArguments, index: Rc<Index>) -> Result<()> {
+    let config: ServerConfig = serde_json::from_slice(&std::fs::read(args.config_path.as_ref().unwrap())?)?;
+
+    let (telemetry_channel, telemetry_receiver) = std::sync::mpsc::channel();
+
+    let config_ = config.clone();
+    std::thread::spawn(move || telemetry_handler(telemetry_receiver, config_));
+
     let service = Service {
         index,
-        inference_server_config: Rc::new(get_backend_config(&args.clip_server).await?),
-        args: Rc::new(args.clone())
+        inference_server_config: Rc::new(get_backend_config(&config.clip_server).await?),
+        config: Rc::new(config.clone()),
+        telemetry_channel
     };
 
-    let listener = TcpListener::bind(args.listen_address.as_ref().unwrap())?;
+    let listener = TcpListener::bind(config.listen_address)?;
     println!("Listening");
     loop {
         let (stream, _) = listener.accept().await?;
@@ -531,7 +675,7 @@ async fn main() -> Result<()> {
         n_descriptors: header.descriptor_cdfs.len(),
     });
 
-    if args.listen_address.is_some() {
+    if args.config_path.is_some() {
         serve(&args, index).await?;
     } else {
         evaluate(&args, index).await?;

@@ -28,6 +28,10 @@
             {#key `${queryCounter}${result.file}`}
                 <div class="result">
                     <ResultImage {result} {results} {updateCounter} {redrawGrid} constrainBy="width" />
+                    {#if result[5]} <!-- debug info -->
+                        <div>{result[0]}</div>
+                        <div>{JSON.stringify(result[5])}</div>
+                    {/if}
                 </div>
             {/key}
         {/each}
@@ -72,7 +76,7 @@
     export const redrawGrid = async () => {
         if (refreshLayout) {
             refreshLayout()
-            await recomputeScroll()
+            setTimeout(recomputeScroll, 0)
         }
     }
 
@@ -82,7 +86,7 @@
     }
 
     const handleScroll = () => {
-        if (window.scrollY + window.innerHeight >= heightThreshold && pendingImageLoads === 0) {
+        if (window.scrollY + window.innerHeight >= heightThreshold) {
             recomputeScroll()
             if (window.scrollY + window.innerHeight < heightThreshold) return;
             let init = displayedResults.length

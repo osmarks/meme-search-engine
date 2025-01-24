@@ -20,27 +20,35 @@ def fetch_embedding(filename):
     csr.close()
     return x.copy() # PyTorch complains otherwise due to bad
 
-def map_rating(rating, uncertainty=0.05):
+def map_rating(rating):
     def map_one(rating):
         match rating:
             case "1": # meme 1 is better
-                return 1 - uncertainty
+                return 0.9
             case "2":
-                return uncertainty
+                return 0.1
+            case "2+" | "2p":
+                return 0.3
+            case "1+" | "1p":
+                return 0.7
             case "eq":
                 return 0.5
             case _: raise ValueError("invalid rating, please fix")
 
     return np.array([map_one(r) for r in rating.split(",")])
 
-def fetch_ratings():
+def fetch_ratings(sets):
     trains = defaultdict(list)
     validations = defaultdict(list)
     csr = db.execute("SELECT meme1, meme2, rating, iteration FROM ratings")
+    its = set()
     for meme1, meme2, rating, iteration in csr.fetchall():
+        if iteration not in its:
+            print(iteration)
+        its.add(iteration)
         (validations if is_val_set(meme1, meme2) else trains)[int((iteration and iteration.split("-")[0]) or "0")].append((fetch_embedding(meme1), fetch_embedding(meme2), map_rating(rating)))
     csr.close()
-    return list(x[1] for x in sorted(trains.items())), list(x[1] for x in sorted(validations.items()))
+    return list(x[1] for x in sorted(trains.items()) if str(x[0]) in sets), list(x[1] for x in sorted(validations.items()) if str(x[0]) in sets)
 
 def generate_random_permutations(x, n):
     out = []
