@@ -47,6 +47,8 @@ This is untested. It might work. The new Rust version simplifies some steps (it 
 
 ## MemeThresher
 
+Note: this has now been superseded by various changes made for the [scaled run](https://osmarks.net/memescale/). Use commit [512b776](https://github.com/osmarks/meme-search-engine/commit/512b776e10a2921b830cda478884d674ccdf1856) for old version.
+
 See [here](https://osmarks.net/memethresher/) for information on MemeThresher, the new automatic meme acquisition/rating system (under `meme-rater`). Deploying it yourself is anticipated to be somewhat tricky but should be roughly doable:
 
 1. Edit `crawler.py` with your own source and run it to collect an initial dataset.
@@ -61,4 +63,28 @@ See [here](https://osmarks.net/memethresher/) for information on MemeThresher, t
 
 ## Scaling
 
-Meme Search Engine uses an in-memory FAISS index to hold its embedding vectors, because I was lazy and it works fine (~100MB total RAM used for my 8000 memes). If you want to store significantly more than that you will have to switch to a more efficient/compact index (see [here](https://github.com/facebookresearch/faiss/wiki/Guidelines-to-choose-an-index)). As vector indices are held exclusively in memory, you will need to either persist them to disk or use ones which are fast to build/remove from/add to (presumably PCA/PQ indices). At some point if you increase total traffic the CLIP model may also become a bottleneck, as I also have no batching strategy. Indexing is currently GPU-bound since the new model appears somewhat slower at high batch sizes and I improved the image loading pipeline. You may also want to scale down displayed memes to cut bandwidth needs.
+This repository contains both the small-scale personal meme search system, which uses an in-memory FAISS index which scales to perhaps ~1e5 items (more with some minor tweaks) and the [larger-scale](https://osmarks.net/memescale/) version based on [DiskANN](https://proceedings.neurips.cc/paper_files/paper/2019/file/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Paper.pdf), which should work up to about ~1e9 and has been tested at hundred-million-item scale. The larger version (accessible [here](https://nooscope.osmarks.net)) is trickier to use. You will have to, roughly:
+
+* Download a [Reddit scrape dataset](https://academictorrents.com/details/ba051999301b109eab37d16f027b3f49ade2de13). You can use other things, obviously, but then you would have to edit the code. Contact me if you're interested.
+* Build and run `reddit-dump` to do the download. It will emit zstandard-compressed msgpack files of records containing metadata and embeddings. This may take some time. Configuration is done by editing `reddit_dump.rs`. I don't currently have a way to run the downloads across multiple machines, but you can put the CLIP backend behind a load balancer.
+    * Use `genseahash.py` to generate hashes of files to discard.
+* Build and run `dump-processor -s` on the resulting zstandard files to generate a sample of ~1 million embeddings to train the OPQ codec and clusters.
+* Use `dump-processor -t` to generate a sample of titles and `generate_queries_bin.py` to generate text embeddings.
+* Use `kmeans.py` with the appropriate `n_clusters` to generate centroids to cluster your dataset such that each of the clusters fits in your available RAM (with some spare space). Note that each vector goes to *two* clusters.
+* Use `aopq_train.py` to train the OPQ codec on your embeddings sample and queries. A GPU is recommended, as I bruteforced some of the problems involved with computing time.
+* Use `dump-processor -C [centroids] -S [shards folder]` to split your dataset into shards.
+    * The shards will be about twice the size of the dump files.
+    * You may want to do filtering at this point. I don't have a provision to do proper deduplication or aesthetic filtering at this stage but you *can* use `-E` to filter by similarity to embeddings. Make sure to use the same filtering settings here as you do later, so that the IDs match.
+* Build `generate-index-shard` and run it on each shard with the queries file from earlier. This will generate small files containing the graph structure.
+* Use `dump-processor -s [some small value] -j` to generate a sample of embeddings and metadata to train a quality model.
+* Use `meme-rater/load_from_json.py` to initialize the rater database from the resulting JSON.
+* Use `meme-rater/rater_server.py` to do data labelling. Its frontend has keyboard controls (QWERT for usefulness, ASDFG for memeness, ZXCVB for aesthetics). You will have to edit this file if you want to rate on other dimensions.
+* Use `meme-rater/train.py` to configure and train a quality model. If you edit the model config here, edit the other scripts, since I never centralized this.
+    * Use one of the `meme-rater/active_learning_*.py` scripts to select high-variance/high-gradient/high-quality samples to label and `copy_into_queue.py` to copy them into the queue.
+    * Do this repeatedly until you like the model.
+    * You can also use a pretrained checkpoint from [here](https://datasets.osmarks.net/projects-formerly-codenamed-radius-tyrian-phase-ii/).
+* Use `meme-rater/ensemble_to_wide_model.py` to export the quality model to be useable by the Rust code.
+* Use `meme-rater/compute_cdf.py` to compute the distribution of quality for packing by `dump-processor`.
+* Use `dump-processor -S [shards folder] -i [index folder] -M [score model] --cdfs [cdfs file]` to generate an index file from the shards, model and CDFs.
+* Build and run `query-disk-index` and fill in its configuration file to serve the index.
+* Build and run the frontend in `clipfront2`.
