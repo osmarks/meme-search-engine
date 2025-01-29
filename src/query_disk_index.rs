@@ -45,7 +45,9 @@ struct CLIArguments {
     #[argh(switch, description="always use full-precision vectors (slow)")]
     disable_pq: bool,
     #[argh(option, short='c', description="server config file")]
-    config_path: Option<String>
+    config_path: Option<String>,
+    #[argh(switch, short='l', description="lock memory")]
+    lock_memory: bool
 }
 
 #[derive(Deserialize, Clone)]
@@ -657,12 +659,20 @@ async fn main() -> Result<()> {
     let pq_codes = unsafe {
         // This is unsafe because other processes could in principle edit the mmap'd file.
         // It would be annoying to do anything about this possibility, so ignore it.
-        MmapOptions::new().populate().map(&pq_codes_file)?
+        MmapOptions::new().populate().map_copy_read_only(&pq_codes_file)?
     };
     // contains metadata descriptors
     let descriptors_file = fs::File::open(index_path.join("index.descriptor-codes.bin")).await?;
     let descriptors = unsafe {
-        MmapOptions::new().populate().map(&descriptors_file)?
+        MmapOptions::new().populate().map_copy_read_only(&descriptors_file)?
+    };
+
+    let _guards = if args.lock_memory {
+        let g1 = region::lock(descriptors.as_ptr(), descriptors.len())?;
+        let g2 = region::lock(pq_codes.as_ptr(), pq_codes.len())?;
+        Some((g1, g2))
+    } else {
+        None
     };
 
     println!("{} items {} dead {} shards", header.count, header.dead_count, header.shards.len());

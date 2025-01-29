@@ -64,6 +64,7 @@ monoio-compat = { version = "0.2", features = ["hyper"] }
 http-body-util = "0.1"
 matrixmultiply = "0.3"
 bitvec = "1"
+region = "3"
 
 [[bin]]
 name = "reddit-dump"
