@@ -300,6 +300,20 @@
         }
     }
 
+    const decodeFloat16 = uint16 => {
+        const sign = (uint16 & 0x8000) ? -1 : 1
+        const exponent = (uint16 & 0x7C00) >> 10
+        const fraction = uint16 & 0x03FF
+
+        if (exponent === 0) {
+            return sign * Math.pow(2, -14) * (fraction / Math.pow(2, 10))
+        } else if (exponent === 0x1F) {
+            return fraction ? NaN : sign * Infinity
+        } else {
+            return sign * Math.pow(2, exponent - 15) * (1 + fraction / Math.pow(2, 10))
+        }
+    }
+
     const parseQueryString = queryStringParams => {
         if (queryStringParams.get("q") && queryTerms.length === 0) {
             newTextQuery(queryStringParams.get("q"))
@@ -344,20 +358,6 @@
         const [fst, snd] = x.split("/")
         if (snd === undefined) return "Not " + fst
         return `${snd}/${fst}`
-    }
-
-    const decodeFloat16 = uint16 => {
-        const sign = (uint16 & 0x8000) ? -1 : 1
-        const exponent = (uint16 & 0x7C00) >> 10
-        const fraction = uint16 & 0x03FF
-
-        if (exponent === 0) {
-            return sign * Math.pow(2, -14) * (fraction / Math.pow(2, 10))
-        } else if (exponent === 0x1F) {
-            return fraction ? NaN : sign * Infinity
-        } else {
-            return sign * Math.pow(2, exponent - 15) * (1 + fraction / Math.pow(2, 10))
-        }
     }
 
     const focusEl = el => el.focus()
