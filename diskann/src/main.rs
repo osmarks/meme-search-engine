@@ -70,7 +70,10 @@ fn main() -> Result<()> {
             l: 192,
             maxc: 750,
             alpha: 65200,
-            saturate_graph: false
+            saturate_graph: false,
+            query_breakpoint: vecs.len() as u32,
+            query_alpha: 65200,
+            max_add_per_stitch_iter: 0
         };
 
         let mut graph = IndexGraph::empty(vecs.len(), config.r);
@@ -105,13 +108,16 @@ fn main() -> Result<()> {
         l: 200,
         alpha: 65536,
         maxc: 0,
-        saturate_graph: false
+        saturate_graph: false,
+        query_breakpoint: vecs.len() as u32,
+        query_alpha: 65200,
+        max_add_per_stitch_iter: 0
     };
 
     let mut scratch = Scratch::new(config);
 
     for (i, vec) in tqdm::tqdm(vecs.iter().enumerate()) {
-        let ctr = greedy_search(&mut scratch, medioid, &vec, &vecs, &graph, config);
+        let ctr = greedy_search(&mut scratch, medioid, false, &vec, &vecs, &graph, config);
         cmps_ctr += ctr.distances;
         cmps.push(ctr.distances);
         if scratch.neighbour_buffer.ids[0] == (i as u32) {

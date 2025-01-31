@@ -22,6 +22,7 @@ use serde::{Serialize, Deserialize};
 use std::str::FromStr;
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Arc;
 
 mod common;
 
@@ -97,7 +98,7 @@ const DUPLICATES_THRESHOLD: f32 = 0.95;
 
 fn read_pq_codes(id: u32, index: Rc<Index>, buf: &mut Vec<u8>) {
     let loc = (id as usize) * index.pq_code_size;
-    buf.extend(&index.pq_codes[loc..loc+index.pq_code_size])
+    buf.extend(&index.memory_maps.pq_codes[loc..loc+index.pq_code_size])
 }
 
 struct VisitedNode {
@@ -121,11 +122,10 @@ struct Scratch {
 
 struct Index {
     data_file: fs::File,
-    pq_codes: Mmap,
     header: Rc<IndexHeader>,
     pq_code_size: usize,
-    descriptors: Mmap,
-    n_descriptors: usize
+    n_descriptors: usize,
+    memory_maps: Arc<MemoryMaps>
 }
 
 struct DescriptorScales(Vec<f32>);
@@ -134,7 +134,7 @@ fn descriptor_product(index: Rc<Index>, scales: &DescriptorScales, neighbour: u3
     let mut result = 0;
     // effectively an extra part of the vector to dot product
     for (j, d) in scales.0.iter().enumerate() {
-        result += scale_dot_result(d * index.descriptors[neighbour as usize * index.n_descriptors + j] as f32);
+        result += scale_dot_result(d * index.memory_maps.descriptors[neighbour as usize * index.n_descriptors + j] as f32);
     }
     result
 }
@@ -220,7 +220,9 @@ fn summary_stats(ranks: &mut [usize]) {
 
 const K: usize = 20;
 
-async fn evaluate(args: &CLIArguments, index: Rc<Index>) -> Result<()> {
+#[monoio::main(threads=1)]
+async fn evaluate(args: Arc<CLIArguments>, memory_maps: Arc<MemoryMaps>) -> Result<()> {
+    let index = initialize_index(args.clone(), memory_maps).await?;
     let mut top_k_ranks_best_shard = vec![];
     let mut top_rank_best_shard = vec![];
     let mut pq_cmps = vec![];
@@ -384,7 +386,7 @@ struct TelemetryMessage {
     event: String,
     #[serde(rename="instanceId")]
     instance_id: String,
-    page: String
+    page: Option<String>
 }
 
 #[derive(Clone)]
@@ -610,7 +612,7 @@ fn telemetry_handler(rx: std::sync::mpsc::Receiver<TelemetryMessage>, config: Se
     Ok(())
 }
 
-async fn serve(args: &CLIArguments, index: Rc<Index>) -> Result<()> {
+async fn serve(args: Arc<CLIArguments>, index: Rc<Index>) -> Result<()> {
     let config: ServerConfig = serde_json::from_slice(&std::fs::read(args.config_path.as_ref().unwrap())?)?;
 
     let (telemetry_channel, telemetry_receiver) = std::sync::mpsc::channel();
@@ -645,51 +647,83 @@ async fn serve(args: &CLIArguments, index: Rc<Index>) -> Result<()> {
     }
 }
 
-#[monoio::main(threads=1, enable_timer=true)]
-async fn main() -> Result<()> {
-    let args: CLIArguments = argh::from_env();
+struct MemoryMaps {
+    pq_codes: memmap2::Mmap,
+    descriptors: memmap2::Mmap,
+    guards: Vec<region::LockGuard>
+}
 
+async fn initialize_index(args: Arc<CLIArguments>, memory_maps: Arc<MemoryMaps>) -> Result<Rc<Index>> {
     let index_path = PathBuf::from(&args.index_path);
     let header: IndexHeader = rmp_serde::from_slice(&fs::read(index_path.join("index.msgpack")).await?)?;
     let header = Rc::new(header);
     // contains graph structure, full-precision vectors, and bulk metadata
     let data_file = fs::File::open(index_path.join("index.bin")).await?;
     // contains product quantization codes
-    let pq_codes_file = fs::File::open(index_path.join("index.pq-codes.bin")).await?;
-    let pq_codes = unsafe {
-        // This is unsafe because other processes could in principle edit the mmap'd file.
-        // It would be annoying to do anything about this possibility, so ignore it.
-        MmapOptions::new().populate().map_copy_read_only(&pq_codes_file)?
-    };
-    // contains metadata descriptors
-    let descriptors_file = fs::File::open(index_path.join("index.descriptor-codes.bin")).await?;
-    let descriptors = unsafe {
-        MmapOptions::new().populate().map_copy_read_only(&descriptors_file)?
-    };
 
-    let _guards = if args.lock_memory {
-        let g1 = region::lock(descriptors.as_ptr(), descriptors.len())?;
-        let g2 = region::lock(pq_codes.as_ptr(), pq_codes.len())?;
-        Some((g1, g2))
-    } else {
-        None
-    };
 
     println!("{} items {} dead {} shards", header.count, header.dead_count, header.shards.len());
 
     let index = Rc::new(Index {
         data_file,
         header: header.clone(),
-        pq_codes,
         pq_code_size: header.quantizer.n_dims / header.quantizer.n_dims_per_code,
-        descriptors,
         n_descriptors: header.descriptor_cdfs.len(),
+        memory_maps
     });
 
-    if args.config_path.is_some() {
-        serve(&args, index).await?;
+    Ok(index)
+}
+
+fn initialize_memory_maps(args: &CLIArguments) -> Result<MemoryMaps> {
+    let index_path = PathBuf::from(&args.index_path);
+    let pq_codes_file = std::fs::File::open(index_path.join("index.pq-codes.bin"))?;
+    let pq_codes = unsafe {
+        // This is unsafe because other processes could in principle edit the mmap'd file.
+        // It would be annoying to do anything about this possibility, so ignore it.
+        MmapOptions::new().populate().map_copy_read_only(&pq_codes_file)?
+    };
+    // contains metadata descriptors
+    let descriptors_file = std::fs::File::open(index_path.join("index.descriptor-codes.bin"))?;
+    let descriptors = unsafe {
+        MmapOptions::new().populate().map_copy_read_only(&descriptors_file)?
+    };
+
+    let guards = if args.lock_memory {
+        let g1 = region::lock(descriptors.as_ptr(), descriptors.len())?;
+        let g2 = region::lock(pq_codes.as_ptr(), pq_codes.len())?;
+        vec![g1, g2]
     } else {
-        evaluate(&args, index).await?;
+        vec![]
+    };
+
+    Ok(MemoryMaps { pq_codes, descriptors, guards })
+}
+
+fn main() -> Result<()> {
+    let args: CLIArguments = argh::from_env();
+
+    let maps = Arc::new(initialize_memory_maps(&args)?);
+
+    let args = Arc::new(args);
+
+    if args.config_path.is_some() {
+        let mut join_handles = vec![];
+        for _ in 0..num_cpus::get() {
+            let args_ = args.clone();
+            let maps_ = maps.clone();
+            let handle = std::thread::spawn(move || {
+                let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new().enable_timer().build().unwrap();
+                let index = rt.block_on(initialize_index(args_.clone(), maps_))?;
+                rt.block_on(serve(args_, index))
+            });
+            join_handles.push(handle);
+        }
+        for handle in join_handles {
+            handle.join().unwrap()?;
+        }
+    } else {
+        evaluate(args, maps)?;
     }
 
     Ok(())

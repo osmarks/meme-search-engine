@@ -1,5 +1,3 @@
-use core::f32;
-
 use half::f16;
 use simsimd::SpatialSimilarity;
 use fastrand::Rng;
@@ -420,6 +418,7 @@ pub fn scale_dot_result_f64(x: f64) -> i64 {
 #[cfg(test)]
 mod bench {
     use super::*;
+    use half::slice::HalfFloatSliceExt;
     use test::Bencher;
 
     #[bench]
@@ -449,6 +448,29 @@ mod bench {
         let b = Vector::randn(&mut rng, 1024);
         be.iter(|| {
             fast_dot_noprefetch(&a, &b)
+        });
+    }
+
+    #[bench]
+    fn bench_preprocess_query(be: &mut Bencher) {
+        let mut rng = fastrand::Rng::with_seed(1);
+        let pq = rmp_serde::from_slice::<ProductQuantizer>(&std::fs::read("opq.msgpack").unwrap()).unwrap();
+        let query = Vector::randn(&mut rng, pq.n_dims).to_f32_vec();
+        be.iter(|| {
+            pq.preprocess_query(&query)
+        });
+    }
+
+    #[bench]
+    fn bench_asymmetric_dot_product(be: &mut Bencher) {
+        let mut rng = fastrand::Rng::with_seed(1);
+        let pq = rmp_serde::from_slice::<ProductQuantizer>(&std::fs::read("opq.msgpack").unwrap()).unwrap();
+        let query = Vector::randn(&mut rng, pq.n_dims).to_f32_vec();
+        let lut = pq.preprocess_query(&query);
+        let mut pq_vectors = vec![0; 100 * pq.n_dims / pq.n_dims_per_code];
+        rng.fill(&mut pq_vectors);
+        be.iter(|| {
+            pq.asymmetric_dot_product(&lut, &pq_vectors)
         });
     }
 }
