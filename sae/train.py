@@ -74,6 +74,7 @@ class JSONEncoder(json.JSONEncoder):
             return str(o)
         else: return super().default(o)
 
+"""
 logfile = f"logs/log-{time.time()}.jsonl"
 with open(logfile, "w") as log:
     steps = 0
@@ -90,7 +91,7 @@ with open(logfile, "w") as log:
                 loss = loss.detach().cpu().item()
                 t.set_description_str(f"loss: {loss:.6f} epoch: {epoch}")
                 log.write(json.dumps({"loss": loss, "step": steps, "time": time.time()}) + "\n")
-                if steps % 5000 == 0: save_ckpt(log, steps)
+                #if steps % 5000 == 0: save_ckpt(log, steps)
                 steps += 1
 
         save_ckpt(log, steps)
@@ -100,3 +101,4 @@ with open(logfile, "w") as log:
         numpy.save(f"ckpt/{steps}.counters.npy", ctr)
 
 print(logfile)
+"""
