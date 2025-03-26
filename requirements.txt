@@ -1,5 +1,5 @@
 Pillow>=10,<11
 prometheus-client>=0.17,<0.18
 aiohttp>=3.8,<4
-open-clip-torch>=2.23.0,<2.24
+open-clip-torch>=2.31.0,<2.32
 msgpack>=1,<2
