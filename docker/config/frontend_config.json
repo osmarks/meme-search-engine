@@ -1,0 +1,8 @@
+{
+    "backend_url": "/backend",
+    "image_path": "/memes/",
+    "thumb_path": "/thumbs/",
+    "name": "Meme Search Engine",
+    "description": "Local instance for something",
+    "about_html": "<marquee>hello</marquee>"
+}

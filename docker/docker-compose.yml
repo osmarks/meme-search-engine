@@ -1,0 +1,17 @@
+services:
+  meme-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8001:80"        # Frontend
+      - "17080:1708"    # Clip server
+    volumes:
+      - ./config:/app/config        # Configuration files
+      - ./memes:/data/memes         # Meme storage
+      - ./thumbs:/data/thumbs
+      - ./db:/app/db                # Databases
+      - ./siglip_model:/app/siglip_model # Model files
+    environment:
+      HTTPS_PROXY: "http://100.64.0.2:8888"
+    # command: tail -f /dev/null

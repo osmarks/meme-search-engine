@@ -15,6 +15,8 @@ They say a picture is worth a thousand words. Unfortunately, many (most?) sets o
 
 ## Setup
 
+New: somewhat tested Dockerized setup under /docker/. Note that you need a model like https://huggingface.co/timm/ViT-SO400M-14-SigLIP-384 (for timm), not one packaged for other libraries.
+
 This is untested. It might work. The new Rust version simplifies some steps (it integrates its own thumbnailing).
 
 * Serve your meme library from a static webserver.

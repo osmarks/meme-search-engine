@@ -1,0 +1,9 @@
+{
+    "clip_server": "http://localhost:1708",
+    "db_path": "/app/db/data.sqlite3",
+    "port": 1707,
+    "files": "/data/memes/",
+    "enable_ocr": false,
+    "thumbs_path": "/data/thumbs",
+    "enable_thumbs": true
+}
