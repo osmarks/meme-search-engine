@@ -147,6 +147,10 @@
         margin-bottom: 6px
 </style>
 
+<svelte:head>
+    <title>{util.hardConfig.name}</title>
+</svelte:head>
+
 <nav>
     <div class="left">
         <NavItem page="search">Search</NavItem>
