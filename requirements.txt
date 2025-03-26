@@ -1,8 +1,5 @@
 Pillow>=10,<11
 prometheus-client>=0.17,<0.18
 aiohttp>=3.8,<4
-aiohttp-cors>=0.7.0,<0.8
-faiss-cpu>=1.7.4,<1.8
-aiosqlite>=0.19.0,<0.20
 open-clip-torch>=2.23.0,<2.24
 msgpack>=1,<2
