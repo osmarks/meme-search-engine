@@ -7,7 +7,7 @@ esbuild
     .build({
         entryPoints: [path.join(__dirname, "app.js")],
         bundle: true,
-        minify: false,
+        minify: true,
         outfile: path.join(__dirname, "../static/app.js"),
         plugins: [sveltePlugin({
             preprocess: {
