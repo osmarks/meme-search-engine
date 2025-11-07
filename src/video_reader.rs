@@ -25,8 +25,8 @@ pub fn run<P: AsRef<std::path::Path>, F: FnMut(RgbImage) -> Result<()>>(path: P,
         aspect_ratio = (1, 1);
     }
 
-    graph.add(&filter::find("buffer").unwrap(), "in", 
-        &format!("video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}", decoder.width(), decoder.height(), decoder.format().descriptor().unwrap().name(), video.time_base().0, video.time_base().1, aspect_ratio.0, aspect_ratio.1))?;
+    graph.add(&filter::find("buffer").unwrap(), "in",
+        &format!("video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}", decoder.width(), decoder.height(), decoder.format().descriptor().context("invalid format")?.name(), video.time_base().0, video.time_base().1, aspect_ratio.0, aspect_ratio.1))?;
     graph.add(&filter::find("buffersink").unwrap(), "out", "")?;
     // I don't know exactly where, but some of my videos apparently have the size vary throughout them.
     // This causes horrible segfaults somewhere.
@@ -45,10 +45,10 @@ pub fn run<P: AsRef<std::path::Path>, F: FnMut(RgbImage) -> Result<()>>(path: P,
             if !decoder.receive_frame(&mut decoded).is_ok() { break }
 
             let mut in_ctx = filter_graph.get("in").unwrap();
-            // The filters really do not like 
+            // The filters really do not like
             let mut src = in_ctx.source();
             src.add(&decoded).context("add frame")?;
-            
+
             while filter_graph.get("out").unwrap().sink().frame(&mut filtered).is_ok() {
                 let mut image = vec![0u8; filtered.width() as usize * filtered.height() as usize * BYTES_PER_PIXEL];
                 let stride = filtered.stride(0);
@@ -56,7 +56,9 @@ pub fn run<P: AsRef<std::path::Path>, F: FnMut(RgbImage) -> Result<()>>(path: P,
                 let width = filtered.width() as usize * BYTES_PER_PIXEL;
                 let height = filtered.height() as usize;
                 for y in 0..height {
-                    image[y * width .. (y + 1) * width].copy_from_slice(&data[y * stride .. y * stride + width]);
+                    if let Some(subslice) = data.get(y * stride .. y * stride + width) {
+                        image[y * width .. (y + 1) * width].copy_from_slice(subslice);
+                    }
                 }
                 frame_callback(image::ImageBuffer::from_vec(filtered.width(), filtered.height(), image).unwrap())?;
             }

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use lazy_static::lazy_static;
-use monoio::fs;
+use monoio::{blocking::DefaultThreadPool, fs};
 use std::path::PathBuf;
 use base64::Engine;
 use argh::FromArgs;
@@ -48,7 +48,9 @@ struct CLIArguments {
     #[argh(option, short='c', description="server config file")]
     config_path: Option<String>,
     #[argh(switch, short='l', description="lock memory")]
-    lock_memory: bool
+    lock_memory: bool,
+    #[argh(option, short='T', description="number of threads to use")]
+    threads: Option<usize>
 }
 
 #[derive(Deserialize, Clone)]
@@ -478,29 +480,35 @@ impl hyper::service::Service<Request<Incoming>> for Service {
                     QUERIES_COUNTER.inc();
 
                     let n_visited = scratch.visited_list.len();
+                    let n_dims = index.header.quantizer.n_dims;
+                    let visited_embeddings = std::mem::replace(&mut scratch.visited_embeddings, vec![]);
 
-                    let mut similarities_against_self = vec![0.0f32; n_visited * n_visited];
+                    let similarities_against_self = monoio::spawn_blocking(move || {
+                        let mut similarities_against_self = vec![0.0f32; n_visited * n_visited];
 
-                    // runtime deduplicate of results list
-                    unsafe {
-                        // vecs @ vecs.T
-                        matrixmultiply::sgemm(
-                            n_visited,
-                            index.header.quantizer.n_dims,
-                            n_visited,
-                            1.0,
-                            scratch.visited_embeddings.as_ptr(),
-                            index.header.quantizer.n_dims as isize,
-                            1,
-                            scratch.visited_embeddings.as_ptr(),
-                            1,
-                            index.header.quantizer.n_dims as isize,
-                            0.0,
-                            similarities_against_self.as_mut_ptr(),
-                            n_visited as isize,
-                            1
-                        );
-                    }
+                        // runtime deduplication of results list
+                        unsafe {
+                            // vecs @ vecs.T
+                            matrixmultiply::sgemm(
+                                n_visited,
+                                n_dims,
+                                n_visited,
+                                1.0,
+                                visited_embeddings.as_ptr(),
+                                n_dims as isize,
+                                1,
+                                visited_embeddings.as_ptr(),
+                                1,
+                                n_dims as isize,
+                                0.0,
+                                similarities_against_self.as_mut_ptr(),
+                                n_visited as isize,
+                                1
+                            );
+                        }
+
+                        similarities_against_self
+                    }).await.map_err(|e| anyhow::anyhow!("threadpool error: {:?}", e))?;
 
                     // discard anything similar to something already in list
                     let mut i = 0;
@@ -709,11 +717,15 @@ fn main() -> Result<()> {
 
     if args.config_path.is_some() {
         let mut join_handles = vec![];
-        for _ in 0..num_cpus::get() {
+        for _ in 0..args.threads.unwrap_or(num_cpus::get()) {
             let args_ = args.clone();
             let maps_ = maps.clone();
             let handle = std::thread::spawn(move || {
-                let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new().enable_timer().build().unwrap();
+                let pool = DefaultThreadPool::new(num_cpus::get());
+                let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+                    .attach_thread_pool(Box::new(pool))
+                    .enable_timer()
+                    .build().unwrap();
                 let index = rt.block_on(initialize_index(args_.clone(), maps_))?;
                 rt.block_on(serve(args_, index))
             });

@@ -34,14 +34,14 @@ serde_bytes = "0.11"
 tower-http = { version = "0.5", features = ["cors"] }
 tower = "0.4"
 json5 = "0.4"
-prometheus = "0.13"
+prometheus = { version = "0.13", features = ["process"] }
 lazy_static = "1"
 zstd = "0.13"
 url = "2"
 fastrand = "2"
 mimalloc = "0.1"
 sonic-rs = "0.3"
-ffmpeg-the-third = "2.0"
+ffmpeg-the-third = "4.0"
 compact_str = { version = "0.8.0-beta", features = ["serde"] }
 itertools = "0.13"
 async-recursion = "1"
@@ -58,7 +58,7 @@ simsimd = "6"
 foldhash = "0.1"
 memmap2 = "0.9"
 candle-core = "0.8"
-monoio = "0.2"
+monoio = { version = "0.2", features = ["sync"] }
 hyper = "1"
 monoio-compat = { version = "0.2", features = ["hyper"] }
 http-body-util = "0.1"
