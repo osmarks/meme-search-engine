@@ -1,7 +1,13 @@
 import * as config from "../../frontend_config.json"
 import { writable, get } from "svelte/store"
 
-export const getURL = x => config.image_path + x[1]
+export const getURL = x => {
+    let rawPath = config.image_path + x[1]
+    for (const [proxyFrom, proxyTo] of Object.entries(config.proxy ?? {}))
+        if (rawPath.startsWith(proxyFrom))
+            return proxyTo + rawPath
+    return rawPath
+}
 
 export const hardConfig = config
 
