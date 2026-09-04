@@ -404,7 +404,7 @@ async fn write_metadata(
     Ok(())
 }
 
-#[instrument]
+#[instrument(skip(client, config, pool, batch, video_embed_times), fields(batch_size = batch.len()))]
 async fn handle_embedding_batch(
     client: reqwest::Client,
     config: Arc<WConfig>,
@@ -461,6 +461,7 @@ async fn handle_embedding_batch(
     to_thumbnail_tx,
     to_ocr_tx,
     to_metadata_write_tx,
+    config,
     video_meta
 ))]
 async fn load_image(
@@ -577,7 +578,7 @@ async fn load_image(
     Ok(())
 }
 
-#[instrument(skip(video_thumb_times, pool, formats))]
+#[instrument(skip(image, config, video_thumb_times, pool, formats))]
 async fn generate_thumbnail(
     image: LoadedImage,
     config: Arc<WConfig>,
@@ -696,13 +697,8 @@ async fn generate_thumbnail(
     Ok(())
 }
 
-#[instrument]
-async fn do_ocr(
-    image: LoadedImage,
-    config: Arc<WConfig>,
-    client: Client,
-    pool: SqlitePool,
-) -> Result<()> {
+#[instrument(skip(image, client, pool))]
+async fn do_ocr(image: LoadedImage, client: Client, pool: SqlitePool) -> Result<()> {
     tracing::debug!("OCRing {:?}", image.filename);
     let scan = match scan_image(&client, &image.image).await {
         Ok(scan) => scan,
@@ -735,7 +731,7 @@ async fn do_ocr(
     Ok(())
 }
 
-#[instrument]
+#[instrument(skip(config))]
 async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
     let pool = initialize_database(&config.service).await?;
     let client = http_client()?;
@@ -812,14 +808,13 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
     let ocr: Option<JoinHandle<Result<()>>> = if config.service.enable_ocr {
         let client = client.clone();
         let pool = pool.clone();
-        let config = config.clone();
+        let ocr_concurrency = config.service.ocr_concurrency;
         let stream = ReceiverStream::new(to_ocr_rx).map(Ok);
         Some(tokio::spawn({
-            stream.try_for_each_concurrent(Some(config.service.ocr_concurrency), move |image| {
+            stream.try_for_each_concurrent(Some(ocr_concurrency), move |image| {
                 let client = client.clone();
                 let pool = pool.clone();
-                let config = config.clone();
-                do_ocr(image, config, client, pool)
+                do_ocr(image, client, pool)
             })
         }))
     } else {
@@ -1004,7 +999,7 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
 
 const INDEX_ADD_BATCH: usize = 1024;
 
-#[instrument]
+#[instrument(skip(config))]
 async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
     let pool = initialize_database(&config.service).await?;
 
@@ -1088,7 +1083,7 @@ async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
     Ok(index)
 }
 
-#[instrument(skip(index))]
+#[instrument(skip(index, query))]
 async fn query_index(
     index: &IIndex,
     query: EmbeddingVector,
@@ -1132,7 +1127,7 @@ async fn query_index(
     })
 }
 
-#[instrument(skip(config, client, index))]
+#[instrument(skip(config, client, index, req))]
 async fn handle_request(
     config: Arc<WConfig>,
     client: Arc<Client>,

@@ -144,7 +144,7 @@ async fn scan_image_chunk(
         .collect())
 }
 
-#[instrument(skip(client))]
+#[instrument(skip(client, image))]
 pub async fn scan_image(client: &Client, image: &DynamicImage) -> Result<ScanResult> {
     let mut result = ScanResult::new();
     let (width, height) = image.dimensions();
