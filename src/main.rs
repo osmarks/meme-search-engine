@@ -1,67 +1,96 @@
 use std::collections::HashSet;
-use std::{collections::HashMap, io::Cursor};
 use std::path::Path;
 use std::sync::Arc;
+use std::{collections::HashMap, io::Cursor};
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::response::Response;
 use axum::{
-    extract::{Json, DefaultBodyLimit},
+    extract::{DefaultBodyLimit, Json},
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Router,
-    http::{HeaderMap, StatusCode}
 };
+use base64::prelude::{Engine, BASE64_URL_SAFE_NO_PAD};
 use common::{resize_for_embed_sync, FrontendInit};
 use compact_str::CompactString;
+use faiss::index::scalar_quantizer;
+use faiss::{ConcurrentIndex, Index};
+use futures_util::stream::{StreamExt, TryStreamExt};
 use image::RgbImage;
-use image::{imageops::FilterType, ImageReader, DynamicImage, ImageFormat};
+use image::{imageops::FilterType, DynamicImage, ImageFormat, ImageReader};
+use lazy_static::lazy_static;
+use mimalloc::MiMalloc;
+use prometheus::{
+    register_int_counter, register_int_counter_vec, register_int_gauge, Encoder, IntCounter,
+    IntCounterVec, IntGauge,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;
 use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
 use tokio::sync::{broadcast, mpsc, RwLock};
-use tokio::task::JoinHandle;
-use walkdir::WalkDir;
-use faiss::{ConcurrentIndex, Index};
-use futures_util::stream::{StreamExt, TryStreamExt};
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
-use faiss::index::scalar_quantizer;
-use lazy_static::lazy_static;
-use prometheus::{register_int_counter, register_int_counter_vec, register_int_gauge, Encoder, IntCounter, IntGauge, IntCounterVec};
 use tracing::instrument;
-use base64::prelude::{BASE64_URL_SAFE_NO_PAD, Engine};
-use mimalloc::MiMalloc;
+use walkdir::WalkDir;
 
-mod ocr;
 mod common;
+mod ocr;
 mod video_reader;
 
+use crate::common::{
+    decode_fp16_buffer, get_backend_config, http_client, query_clip_server, resize_for_embed,
+    EmbeddingRequest, EmbeddingVector, InferenceServerConfig, QueryRequest, QueryResult,
+};
 use crate::ocr::scan_image;
-use crate::common::{InferenceServerConfig, resize_for_embed, EmbeddingRequest, get_backend_config, query_clip_server, decode_fp16_buffer, QueryRequest, QueryResult, EmbeddingVector};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 lazy_static! {
-    static ref RELOADS_COUNTER: IntCounter = register_int_counter!("mse_reloads", "reloads executed").unwrap();
-    static ref QUERIES_COUNTER: IntCounter = register_int_counter!("mse_queries", "queries executed").unwrap();
-    static ref IMAGES_LOADED_COUNTER: IntCounter = register_int_counter!("mse_loads", "images loaded by ingest process").unwrap();
-    static ref IMAGES_LOADED_ERROR_COUNTER: IntCounter = register_int_counter!("mse_load_errors", "image load fails by ingest process").unwrap();
-    static ref VIDEOS_LOADED_COUNTER: IntCounter = register_int_counter!("mse_video_loads", "video loaded by ingest process").unwrap();
-    static ref VIDEOS_LOADED_ERROR_COUNTER: IntCounter = register_int_counter!("mse_video_load_errors", "video load fails by ingest process").unwrap();
-    static ref IMAGES_EMBEDDED_COUNTER: IntCounter = register_int_counter!("mse_embeds", "images embedded by ingest process").unwrap();
-    static ref IMAGES_OCRED_COUNTER: IntCounter = register_int_counter!("mse_ocrs", "images OCRed by ingest process").unwrap();
-    static ref IMAGES_OCRED_ERROR_COUNTER: IntCounter = register_int_counter!("mse_ocr_errors", "image OCR fails by ingest process").unwrap();
-    static ref IMAGES_THUMBNAILED_COUNTER: IntCounter = register_int_counter!("mse_thumbnails", "images thumbnailed by ingest process").unwrap();
-    static ref THUMBNAILS_GENERATED_COUNTER: IntCounterVec = register_int_counter_vec!("mse_thumbnail_outputs", "thumbnails produced by ingest process", &["output_format"]).unwrap();
-    static ref LAST_INDEX_SIZE: IntGauge = register_int_gauge!("mse_index_size", "images in loaded index").unwrap();
+    static ref RELOADS_COUNTER: IntCounter =
+        register_int_counter!("mse_reloads", "reloads executed").unwrap();
+    static ref QUERIES_COUNTER: IntCounter =
+        register_int_counter!("mse_queries", "queries executed").unwrap();
+    static ref IMAGES_LOADED_COUNTER: IntCounter =
+        register_int_counter!("mse_loads", "images loaded by ingest process").unwrap();
+    static ref IMAGES_LOADED_ERROR_COUNTER: IntCounter =
+        register_int_counter!("mse_load_errors", "image load fails by ingest process").unwrap();
+    static ref VIDEOS_LOADED_COUNTER: IntCounter =
+        register_int_counter!("mse_video_loads", "video loaded by ingest process").unwrap();
+    static ref VIDEOS_LOADED_ERROR_COUNTER: IntCounter = register_int_counter!(
+        "mse_video_load_errors",
+        "video load fails by ingest process"
+    )
+    .unwrap();
+    static ref IMAGES_EMBEDDED_COUNTER: IntCounter =
+        register_int_counter!("mse_embeds", "images embedded by ingest process").unwrap();
+    static ref IMAGES_OCRED_COUNTER: IntCounter =
+        register_int_counter!("mse_ocrs", "images OCRed by ingest process").unwrap();
+    static ref IMAGES_OCRED_ERROR_COUNTER: IntCounter =
+        register_int_counter!("mse_ocr_errors", "image OCR fails by ingest process").unwrap();
+    static ref IMAGES_THUMBNAILED_COUNTER: IntCounter =
+        register_int_counter!("mse_thumbnails", "images thumbnailed by ingest process").unwrap();
+    static ref THUMBNAILS_GENERATED_COUNTER: IntCounterVec = register_int_counter_vec!(
+        "mse_thumbnail_outputs",
+        "thumbnails produced by ingest process",
+        &["output_format"]
+    )
+    .unwrap();
+    static ref LAST_INDEX_SIZE: IntGauge =
+        register_int_gauge!("mse_index_size", "images in loaded index").unwrap();
 }
 
-fn function_which_returns_50() -> usize { 50 }
-fn function_which_will_return_the_integer_one_successor_of_zero_but_as_a_float() -> f32 { 1.0 }
+fn function_which_returns_50() -> usize {
+    50
+}
+fn function_which_will_return_the_integer_one_successor_of_zero_but_as_a_float() -> f32 {
+    1.0
+}
 
 #[derive(Debug, Deserialize, Clone)]
 struct Config {
@@ -75,19 +104,22 @@ struct Config {
     thumbs_path: String,
     #[serde(default)]
     enable_thumbs: bool,
-    #[serde(default="function_which_returns_50")]
+    #[serde(default = "function_which_returns_50")]
     ocr_concurrency: usize,
     #[serde(default)]
     no_run_server: bool,
-    #[serde(default="function_which_will_return_the_integer_one_successor_of_zero_but_as_a_float")]
-    video_frame_interval: f32
+    #[serde(
+        default = "function_which_will_return_the_integer_one_successor_of_zero_but_as_a_float"
+    )]
+    video_frame_interval: f32,
 }
 
 #[derive(Debug, Clone)]
 struct WConfig {
     backend: InferenceServerConfig,
     service: Config,
-    predefined_embeddings: HashMap<String, ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<[usize; 1]>>>
+    predefined_embeddings:
+        HashMap<String, ndarray::ArrayBase<ndarray::OwnedRepr<f32>, ndarray::Dim<[usize; 1]>>>,
 }
 
 #[derive(Debug)]
@@ -97,11 +129,11 @@ struct IIndex {
     filenames: Vec<Filename>,
     format_codes: Vec<u64>,
     format_names: Vec<String>,
-    metadata: Vec<Option<FileMetadata>>
+    metadata: Vec<Option<FileMetadata>>,
 }
 
 const SCHEMA: &[&str] = &[
-r#"
+    r#"
 CREATE TABLE IF NOT EXISTS files (
     filename TEXT NOT NULL PRIMARY KEY,
     embedding_time INTEGER,
@@ -123,15 +155,16 @@ DROP TRIGGER IF EXISTS ocr_fts_ins;
 DROP TRIGGER IF EXISTS ocr_fts_del;
 DROP TABLE IF EXISTS ocr_fts;
 "#,
-r#"
+    r#"
 ALTER TABLE files ADD COLUMN metadata BLOB;
-"#];
+"#,
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileMetadata {
     width: u32,
     height: u32,
-    frames: Option<u32>
+    frames: Option<u32>,
 }
 
 #[derive(Debug, sqlx::FromRow, Clone)]
@@ -145,7 +178,7 @@ struct RawFileRecord {
     ocr: Option<String>,
     raw_ocr_segments: Option<Vec<u8>>,
     thumbnails: Option<Vec<u8>>,
-    metadata: Option<Vec<u8>>
+    metadata: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,7 +187,7 @@ struct FileRecord {
     needs_embed: bool,
     needs_ocr: bool,
     needs_thumbnail: bool,
-    needs_metadata: bool
+    needs_metadata: bool,
 }
 
 #[derive(Debug)]
@@ -162,13 +195,13 @@ struct LoadedImage {
     image: Arc<DynamicImage>,
     filename: Filename,
     original_filesize: Option<usize>,
-    fast_thumbnails_only: bool
+    fast_thumbnails_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 enum Filename {
     Actual(CompactString),
-    VideoFrame(CompactString, u32)
+    VideoFrame(CompactString, u32),
 }
 
 // this is a somewhat horrible hack, but probably nobody has NUL bytes at the start of filenames?
@@ -176,7 +209,7 @@ impl Filename {
     fn decode(buf: Vec<u8>) -> Result<Self> {
         Ok(match buf.strip_prefix(&[0]) {
             Some(remainder) => rmp_serde::from_read(&*remainder)?,
-            None => Filename::Actual(CompactString::from_utf8(buf)?)
+            None => Filename::Actual(CompactString::from_utf8(buf)?),
         })
     }
 
@@ -194,7 +227,7 @@ impl Filename {
     fn container_filename(&self) -> String {
         match self {
             Self::Actual(s) => s.to_string(),
-            Self::VideoFrame(s, _) => s.to_string()
+            Self::VideoFrame(s, _) => s.to_string(),
         }
     }
 }
@@ -203,6 +236,19 @@ impl Filename {
 struct EmbeddingInput {
     image: Vec<u8>,
     filename: Filename,
+}
+
+/// Tokio detaches tasks when their JoinHandles are dropped. An early return from
+/// an ingest must instead cancel its pipeline, or each failed reload can leave a
+/// complete set of workers (and their queued images) alive.
+struct AbortTasksOnDrop(Vec<AbortHandle>);
+
+impl Drop for AbortTasksOnDrop {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 fn timestamp() -> i64 {
@@ -216,7 +262,7 @@ struct ImageFormatConfig {
     quality: u8,
     format: ImageFormat,
     extension: String,
-    is_fast: bool
+    is_fast: bool,
 }
 
 fn generate_filename_hash(filename: &Filename) -> String {
@@ -224,7 +270,7 @@ fn generate_filename_hash(filename: &Filename) -> String {
     let mut hasher = fnv::FnvHasher::default();
     match filename {
         Filename::Actual(x) => x.hash(&mut hasher),
-        _ => filename.hash(&mut hasher)
+        _ => filename.hash(&mut hasher),
     };
     BASE64_URL_SAFE_NO_PAD.encode(hasher.finish().to_le_bytes())
 }
@@ -244,18 +290,23 @@ fn generate_thumbnail_filename(
 
 async fn initialize_database(config: &Config) -> Result<SqlitePool> {
     let connection_options = SqliteConnectOptions::new()
-    .filename(&config.db_path)
-    .create_if_missing(true);
+        .filename(&config.db_path)
+        .create_if_missing(true);
     let pool = SqlitePool::connect_with(connection_options).await?;
     let mut tx = pool.begin().await?;
-    let version = sqlx::query_scalar!("PRAGMA user_version").fetch_one(&mut *tx).await?.unwrap();
+    let version = sqlx::query_scalar!("PRAGMA user_version")
+        .fetch_one(&mut *tx)
+        .await?
+        .unwrap();
     for (index, sql) in SCHEMA.iter().enumerate() {
         if (index as i32) < version {
-            continue
+            continue;
         }
         tracing::info!("Migrating to DB version {}", index);
         sqlx::query(sql).execute(&mut *tx).await?;
-        sqlx::query(&format!("PRAGMA user_version = {}", index + 1)).execute(&mut *tx).await?;
+        sqlx::query(&format!("PRAGMA user_version = {}", index + 1))
+            .execute(&mut *tx)
+            .await?;
     }
     tx.commit().await?;
     Ok(pool)
@@ -271,7 +322,7 @@ fn image_formats(_config: &Config) -> HashMap<String, ImageFormatConfig> {
             quality: 70,
             format: ImageFormat::Jpeg,
             extension: "jpg".to_string(),
-            is_fast: true
+            is_fast: true,
         },
     );
     formats.insert(
@@ -282,7 +333,7 @@ fn image_formats(_config: &Config) -> HashMap<String, ImageFormatConfig> {
             quality: 80,
             format: ImageFormat::Jpeg,
             extension: "jpg".to_string(),
-            is_fast: true
+            is_fast: true,
         },
     );
     formats.insert(
@@ -293,7 +344,7 @@ fn image_formats(_config: &Config) -> HashMap<String, ImageFormatConfig> {
             quality: 0,
             format: ImageFormat::Jpeg,
             extension: "jpg".to_string(),
-            is_fast: false
+            is_fast: false,
         },
     );
     formats.insert(
@@ -304,7 +355,7 @@ fn image_formats(_config: &Config) -> HashMap<String, ImageFormatConfig> {
             quality: 80,
             format: ImageFormat::Avif,
             extension: "avif".to_string(),
-            is_fast: false
+            is_fast: false,
         },
     );
     formats.insert(
@@ -315,40 +366,65 @@ fn image_formats(_config: &Config) -> HashMap<String, ImageFormatConfig> {
             quality: 70,
             format: ImageFormat::Avif,
             extension: "avif".to_string(),
-            is_fast: false
+            is_fast: false,
         },
     );
     formats
 }
 
 #[instrument(skip_all)]
-async fn ensure_filename_record_exists(conn: &mut SqliteConnection, filename_enc: &Vec<u8>) -> Result<()> {
-    sqlx::query!("INSERT OR IGNORE INTO files (filename) VALUES (?)", filename_enc)
-        .execute(conn)
-        .await?;
+async fn ensure_filename_record_exists(
+    conn: &mut SqliteConnection,
+    filename_enc: &Vec<u8>,
+) -> Result<()> {
+    sqlx::query!(
+        "INSERT OR IGNORE INTO files (filename) VALUES (?)",
+        filename_enc
+    )
+    .execute(conn)
+    .await?;
     Ok(())
 }
 
 #[instrument(skip_all)]
-async fn write_metadata(conn: &mut SqliteConnection, filename_enc: &Vec<u8>, metadata: FileMetadata) -> Result<()> {
+async fn write_metadata(
+    conn: &mut SqliteConnection,
+    filename_enc: &Vec<u8>,
+    metadata: FileMetadata,
+) -> Result<()> {
     ensure_filename_record_exists(conn, filename_enc).await?;
     let metadata_serialized = rmp_serde::to_vec_named(&metadata)?;
-    sqlx::query!("UPDATE files SET metadata = ? WHERE filename = ?", metadata_serialized, filename_enc)
-        .execute(conn)
-        .await?;
+    sqlx::query!(
+        "UPDATE files SET metadata = ? WHERE filename = ?",
+        metadata_serialized,
+        filename_enc
+    )
+    .execute(conn)
+    .await?;
     Ok(())
 }
 
 #[instrument]
-async fn handle_embedding_batch(client: reqwest::Client, config: Arc<WConfig>, pool: SqlitePool, batch: Vec<EmbeddingInput>, video_embed_times: Arc<RwLock<HashMap<CompactString, i64>>>) -> Result<()> {
+async fn handle_embedding_batch(
+    client: reqwest::Client,
+    config: Arc<WConfig>,
+    pool: SqlitePool,
+    batch: Vec<EmbeddingInput>,
+    video_embed_times: Arc<RwLock<HashMap<CompactString, i64>>>,
+) -> Result<()> {
     let result: Vec<serde_bytes::ByteBuf> = query_clip_server(
         &client,
         &config.service.clip_server,
         "",
         EmbeddingRequest::Images {
-            images: batch.iter().map(|input| serde_bytes::ByteBuf::from(input.image.clone())).collect(),
+            images: batch
+                .iter()
+                .map(|input| serde_bytes::ByteBuf::from(input.image.clone()))
+                .collect(),
         },
-    ).await.context("querying CLIP server")?;
+    )
+    .await
+    .context("querying CLIP server")?;
 
     let mut tx = pool.begin().await?;
     let ts = timestamp();
@@ -359,8 +435,13 @@ async fn handle_embedding_batch(client: reqwest::Client, config: Arc<WConfig>, p
         IMAGES_EMBEDDED_COUNTER.inc();
         ensure_filename_record_exists(&mut *tx, &encoded_filename).await?;
         match &batch[i].filename {
-            Filename::VideoFrame(container, _) => { video_embed_times.write().await.insert(container.clone(), timestamp()); },
-            _ => ()
+            Filename::VideoFrame(container, _) => {
+                video_embed_times
+                    .write()
+                    .await
+                    .insert(container.clone(), timestamp());
+            }
+            _ => (),
         }
         sqlx::query!(
             "UPDATE files SET embedding_time = ?, embedding = ? WHERE filename = ?",
@@ -368,17 +449,35 @@ async fn handle_embedding_batch(client: reqwest::Client, config: Arc<WConfig>, p
             vector,
             encoded_filename
         )
-            .execute(&mut *tx)
-            .await?;
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
     anyhow::Result::Ok(())
 }
 
-#[instrument(skip(to_embed_tx, to_thumbnail_tx, to_ocr_tx, to_metadata_write_tx, video_meta))]
-async fn load_image(record: FileRecord, to_embed_tx: mpsc::Sender<EmbeddingInput>, to_thumbnail_tx: mpsc::Sender<LoadedImage>, to_ocr_tx: mpsc::Sender<LoadedImage>, to_metadata_write_tx: mpsc::Sender<(Filename, FileMetadata)>, config: Arc<WConfig>, video_meta: Arc<RwLock<HashMap<CompactString, FileMetadata>>>) -> Result<()> {
+#[instrument(skip(
+    to_embed_tx,
+    to_thumbnail_tx,
+    to_ocr_tx,
+    to_metadata_write_tx,
+    video_meta
+))]
+async fn load_image(
+    record: FileRecord,
+    to_embed_tx: mpsc::Sender<EmbeddingInput>,
+    to_thumbnail_tx: mpsc::Sender<LoadedImage>,
+    to_ocr_tx: mpsc::Sender<LoadedImage>,
+    to_metadata_write_tx: mpsc::Sender<(Filename, FileMetadata)>,
+    config: Arc<WConfig>,
+    video_meta: Arc<RwLock<HashMap<CompactString, FileMetadata>>>,
+) -> Result<()> {
     let path = Path::new(&config.service.files).join(&*record.filename);
-    let image: Result<Arc<DynamicImage>> = tokio::task::block_in_place(|| Ok(Arc::new(ImageReader::open(&path)?.with_guessed_format()?.decode()?)));
+    let image: Result<Arc<DynamicImage>> = tokio::task::block_in_place(|| {
+        Ok(Arc::new(
+            ImageReader::open(&path)?.with_guessed_format()?.decode()?,
+        ))
+    });
     let image = match image {
         Ok(image) => image,
         Err(e) => {
@@ -394,12 +493,12 @@ async fn load_image(record: FileRecord, to_embed_tx: mpsc::Sender<EmbeddingInput
                     let filename = Filename::VideoFrame(filename.clone(), i);
                     to_embed_tx.blocking_send(EmbeddingInput {
                         image: embed_buf,
-                        filename: filename.clone()
+                        filename: filename.clone(),
                     })?;
                     let meta = FileMetadata {
                         height: frame.height(),
                         width: frame.width(),
-                        frames: Some(i + 1)
+                        frames: Some(i + 1),
                     };
                     last_metadata = Some(meta.clone());
                     to_metadata_write_tx.blocking_send((filename.clone(), meta))?;
@@ -408,7 +507,7 @@ async fn load_image(record: FileRecord, to_embed_tx: mpsc::Sender<EmbeddingInput
                             image: frame.clone(),
                             filename,
                             original_filesize: None,
-                            fast_thumbnails_only: true
+                            fast_thumbnails_only: true,
                         })?;
                     }
                     i += 1;
@@ -417,19 +516,20 @@ async fn load_image(record: FileRecord, to_embed_tx: mpsc::Sender<EmbeddingInput
                 match video_reader::run(&path, callback, config.service.video_frame_interval) {
                     Ok(()) => {
                         VIDEOS_LOADED_COUNTER.inc();
-                        return anyhow::Result::Ok(last_metadata)
-                    },
+                        return anyhow::Result::Ok(last_metadata);
+                    }
                     Err(e) => {
                         tracing::error!("Could not read {} as video: {}", filename, e);
                         VIDEOS_LOADED_ERROR_COUNTER.inc();
                     }
                 }
-                return anyhow::Result::Ok(last_metadata)
-            }).await??;
+                return anyhow::Result::Ok(last_metadata);
+            })
+            .await??;
             if let Some(meta) = meta {
                 video_meta.write().await.insert(record.filename, meta);
             }
-            return Ok(())
+            return Ok(());
         }
     };
     let filename = Filename::Actual(record.filename);
@@ -437,15 +537,22 @@ async fn load_image(record: FileRecord, to_embed_tx: mpsc::Sender<EmbeddingInput
         let metadata = FileMetadata {
             width: image.width(),
             height: image.height(),
-            frames: None
+            frames: None,
         };
-        to_metadata_write_tx.send((filename.clone(), metadata)).await?;
+        to_metadata_write_tx
+            .send((filename.clone(), metadata))
+            .await?;
     }
     IMAGES_LOADED_COUNTER.inc();
     if record.needs_embed {
         let resized = resize_for_embed(config.backend.clone(), image.clone()).await?;
 
-        to_embed_tx.send(EmbeddingInput { image: resized, filename: filename.clone() }).await?
+        to_embed_tx
+            .send(EmbeddingInput {
+                image: resized,
+                filename: filename.clone(),
+            })
+            .await?
     }
     if record.needs_thumbnail {
         to_thumbnail_tx
@@ -453,7 +560,7 @@ async fn load_image(record: FileRecord, to_embed_tx: mpsc::Sender<EmbeddingInput
                 image: image.clone(),
                 filename: filename.clone(),
                 original_filesize: Some(std::fs::metadata(&path)?.len() as usize),
-                fast_thumbnails_only: false
+                fast_thumbnails_only: false,
             })
             .await?;
     }
@@ -463,7 +570,7 @@ async fn load_image(record: FileRecord, to_embed_tx: mpsc::Sender<EmbeddingInput
                 image,
                 filename: filename.clone(),
                 original_filesize: None,
-                fast_thumbnails_only: true
+                fast_thumbnails_only: true,
             })
             .await?;
     }
@@ -471,7 +578,13 @@ async fn load_image(record: FileRecord, to_embed_tx: mpsc::Sender<EmbeddingInput
 }
 
 #[instrument(skip(video_thumb_times, pool, formats))]
-async fn generate_thumbnail(image: LoadedImage, config: Arc<WConfig>, video_thumb_times: Arc<RwLock<HashMap<CompactString, i64>>>, pool: SqlitePool, formats: Arc<HashMap<String, ImageFormatConfig>>) -> Result<()> {
+async fn generate_thumbnail(
+    image: LoadedImage,
+    config: Arc<WConfig>,
+    video_thumb_times: Arc<RwLock<HashMap<CompactString, i64>>>,
+    pool: SqlitePool,
+    formats: Arc<HashMap<String, ImageFormatConfig>>,
+) -> Result<()> {
     use image::codecs::*;
 
     let filename = image.filename.clone();
@@ -481,7 +594,9 @@ async fn generate_thumbnail(image: LoadedImage, config: Arc<WConfig>, video_thum
         let mut generated_formats = Vec::new();
         let rgb = DynamicImage::from(image.image.to_rgb8());
         for (format_name, format_config) in &*formats {
-            if !format_config.is_fast && image.fast_thumbnails_only { continue }
+            if !format_config.is_fast && image.fast_thumbnails_only {
+                continue;
+            }
             let resized = if format_config.target_filesize != 0 {
                 let mut lb = 1;
                 let mut ub = 100;
@@ -496,9 +611,13 @@ async fn generate_thumbnail(image: LoadedImage, config: Arc<WConfig>, video_thum
                     let mut csr = Cursor::new(&mut buf);
                     // this is ugly but I don't actually know how to fix it (cannot factor it out due to issues with dyn Trait)
                     match format_config.format {
-                        ImageFormat::Avif => thumbnail.write_with_encoder(avif::AvifEncoder::new_with_speed_quality(&mut csr, 4, quality)),
-                        ImageFormat::Jpeg => thumbnail.write_with_encoder(jpeg::JpegEncoder::new_with_quality(&mut csr, quality)),
-                        _ => unimplemented!()
+                        ImageFormat::Avif => thumbnail.write_with_encoder(
+                            avif::AvifEncoder::new_with_speed_quality(&mut csr, 4, quality),
+                        ),
+                        ImageFormat::Jpeg => thumbnail.write_with_encoder(
+                            jpeg::JpegEncoder::new_with_quality(&mut csr, quality),
+                        ),
+                        _ => unimplemented!(),
                     }?;
                     if buf.len() > format_config.target_filesize {
                         ub = quality;
@@ -518,28 +637,38 @@ async fn generate_thumbnail(image: LoadedImage, config: Arc<WConfig>, video_thum
                 let mut buf: Vec<u8> = Vec::new();
                 let mut csr = Cursor::new(&mut buf);
                 match format_config.format {
-                    ImageFormat::Avif => thumbnail.write_with_encoder(avif::AvifEncoder::new_with_speed_quality(&mut csr, 4, format_config.quality)),
-                    ImageFormat::Jpeg => thumbnail.write_with_encoder(jpeg::JpegEncoder::new_with_quality(&mut csr, format_config.quality)),
-                    ImageFormat::WebP => thumbnail.write_with_encoder(webp::WebPEncoder::new_lossless(&mut csr)),
-                    _ => unimplemented!()
+                    ImageFormat::Avif => {
+                        thumbnail.write_with_encoder(avif::AvifEncoder::new_with_speed_quality(
+                            &mut csr,
+                            4,
+                            format_config.quality,
+                        ))
+                    }
+                    ImageFormat::Jpeg => thumbnail.write_with_encoder(
+                        jpeg::JpegEncoder::new_with_quality(&mut csr, format_config.quality),
+                    ),
+                    ImageFormat::WebP => {
+                        thumbnail.write_with_encoder(webp::WebPEncoder::new_lossless(&mut csr))
+                    }
+                    _ => unimplemented!(),
                 }?;
                 buf
             };
             if resized.len() < image.original_filesize.unwrap_or(usize::MAX) {
                 generated_formats.push(format_name.clone());
                 let thumbnail_path = Path::new(&config.service.thumbs_path).join(
-                    generate_thumbnail_filename(
-                        &image.filename,
-                        format_name,
-                        format_config,
-                    ),
+                    generate_thumbnail_filename(&image.filename, format_name, format_config),
                 );
-                THUMBNAILS_GENERATED_COUNTER.get_metric_with_label_values(&[format_name]).unwrap().inc();
+                THUMBNAILS_GENERATED_COUNTER
+                    .get_metric_with_label_values(&[format_name])
+                    .unwrap()
+                    .inc();
                 std::fs::write(thumbnail_path, resized)?;
             }
         }
         Ok::<Vec<String>, anyhow::Error>(generated_formats)
-    }).await??;
+    })
+    .await??;
 
     IMAGES_THUMBNAILED_COUNTER.inc();
     let formats_data = rmp_serde::to_vec(&generated_formats)?;
@@ -548,8 +677,13 @@ async fn generate_thumbnail(image: LoadedImage, config: Arc<WConfig>, video_thum
     let mut conn = pool.acquire().await?;
     ensure_filename_record_exists(&mut conn, &filename_enc).await?;
     match filename {
-        Filename::VideoFrame(container, _) => { video_thumb_times.write().await.insert(container.clone(), timestamp()); },
-        _ => ()
+        Filename::VideoFrame(container, _) => {
+            video_thumb_times
+                .write()
+                .await
+                .insert(container.clone(), timestamp());
+        }
+        _ => (),
     }
     sqlx::query!(
         "UPDATE files SET thumbnails = ?, thumbnail_time = ? WHERE filename = ?",
@@ -557,20 +691,25 @@ async fn generate_thumbnail(image: LoadedImage, config: Arc<WConfig>, video_thum
         ts,
         filename_enc
     )
-        .execute(&mut *conn)
-        .await?;
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 
 #[instrument]
-async fn do_ocr(image: LoadedImage, config: Arc<WConfig>, client: Client, pool: SqlitePool) -> Result<()> {
+async fn do_ocr(
+    image: LoadedImage,
+    config: Arc<WConfig>,
+    client: Client,
+    pool: SqlitePool,
+) -> Result<()> {
     tracing::debug!("OCRing {:?}", image.filename);
     let scan = match scan_image(&client, &image.image).await {
         Ok(scan) => scan,
         Err(e) => {
             IMAGES_OCRED_ERROR_COUNTER.inc();
             tracing::error!("OCR failure {:?}: {}", image.filename, e);
-            return Ok(())
+            return Ok(());
         }
     };
     IMAGES_OCRED_COUNTER.inc();
@@ -591,15 +730,15 @@ async fn do_ocr(image: LoadedImage, config: Arc<WConfig>, client: Client, pool: 
         ts,
         filename_enc
     )
-        .execute(&mut *conn)
-        .await?;
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 
 #[instrument]
 async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
     let pool = initialize_database(&config.service).await?;
-    let client = Client::new();
+    let client = http_client()?;
 
     let formats = image_formats(&config.service);
 
@@ -607,7 +746,8 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
     let (to_embed_tx, to_embed_rx) = mpsc::channel(config.backend.batch as usize);
     let (to_thumbnail_tx, to_thumbnail_rx) = mpsc::channel(30);
     let (to_ocr_tx, to_ocr_rx) = mpsc::channel(30);
-    let (to_metadata_write_tx, mut to_metadata_write_rx) = mpsc::channel::<(Filename, FileMetadata)>(100);
+    let (to_metadata_write_tx, mut to_metadata_write_rx) =
+        mpsc::channel::<(Filename, FileMetadata)>(100);
 
     let cpus = num_cpus::get();
 
@@ -627,7 +767,15 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
             let to_ocr_tx = to_ocr_tx.clone();
             let video_meta = video_meta.clone();
             let to_metadata_write_tx = to_metadata_write_tx.clone();
-            load_image(record, to_embed_tx, to_thumbnail_tx, to_ocr_tx, to_metadata_write_tx, config, video_meta)
+            load_image(
+                record,
+                to_embed_tx,
+                to_thumbnail_tx,
+                to_ocr_tx,
+                to_metadata_write_tx,
+                config,
+                video_meta,
+            )
         })
     });
 
@@ -685,14 +833,28 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
         let pool = pool.clone();
         let video_embed_times = video_embed_times.clone();
         // keep multiple embedding requests in flight
-        stream.map(Ok).try_for_each_concurrent(Some(3), move |batch| {
-            let client = client.clone();
-            let config = config.clone();
-            let pool = pool.clone();
-            let video_embed_times = video_embed_times.clone();
-            handle_embedding_batch(client, config, pool, batch, video_embed_times)
-        })
+        stream
+            .map(Ok)
+            .try_for_each_concurrent(Some(3), move |batch| {
+                let client = client.clone();
+                let config = config.clone();
+                let pool = pool.clone();
+                let video_embed_times = video_embed_times.clone();
+                handle_embedding_batch(client, config, pool, batch, video_embed_times)
+            })
     });
+
+    let _abort_tasks_on_drop = AbortTasksOnDrop(
+        vec![
+            image_loading.abort_handle(),
+            metadata_writer.abort_handle(),
+            embedding_generation.abort_handle(),
+        ]
+        .into_iter()
+        .chain(thumbnail_generation.as_ref().map(JoinHandle::abort_handle))
+        .chain(ocr.as_ref().map(JoinHandle::abort_handle))
+        .collect(),
+    );
 
     let mut actual_filenames = HashMap::new();
 
@@ -702,8 +864,13 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
             let entry = entry?;
             let path = entry.path();
             if path.is_file() {
-                let filename = CompactString::from(path.strip_prefix(&config.service.files)?.to_str().unwrap());
-                let modtime = entry.metadata()?.modified()?.duration_since(std::time::UNIX_EPOCH)?;
+                let filename = CompactString::from(
+                    path.strip_prefix(&config.service.files)?.to_str().unwrap(),
+                );
+                let modtime = entry
+                    .metadata()?
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)?;
                 let modtime = modtime.as_micros() as i64;
                 actual_filenames.insert(filename.clone(), (path.to_path_buf(), modtime));
             }
@@ -716,9 +883,13 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
     for (filename, (_path, modtime)) in actual_filenames.iter() {
         let modtime = *modtime;
         let filename_arr = filename.as_bytes();
-        let record = sqlx::query_as!(RawFileRecord, "SELECT * FROM files WHERE filename = ?", filename_arr)
-            .fetch_optional(&pool)
-            .await?;
+        let record = sqlx::query_as!(
+            RawFileRecord,
+            "SELECT * FROM files WHERE filename = ?",
+            filename_arr
+        )
+        .fetch_optional(&pool)
+        .await?;
 
         let new_record = match record {
             None => Some(FileRecord {
@@ -726,17 +897,23 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
                 needs_embed: true,
                 needs_ocr: config.service.enable_ocr,
                 needs_thumbnail: config.service.enable_thumbs,
-                needs_metadata: true
+                needs_metadata: true,
             }),
             Some(r) => {
                 let needs_embed = modtime > r.embedding_time.unwrap_or(i64::MIN);
-                let needs_ocr = modtime > r.ocr_time.unwrap_or(i64::MIN) && config.service.enable_ocr;
-                let needs_thumbnail = modtime > r.thumbnail_time.unwrap_or(i64::MIN) && config.service.enable_thumbs;
-                let needs_metadata = modtime > r.embedding_time.unwrap_or(i64::MIN) || r.metadata.is_none(); // we don't store metadata acquisition time so assume it happens roughly when embedding does
+                let needs_ocr =
+                    modtime > r.ocr_time.unwrap_or(i64::MIN) && config.service.enable_ocr;
+                let needs_thumbnail =
+                    modtime > r.thumbnail_time.unwrap_or(i64::MIN) && config.service.enable_thumbs;
+                let needs_metadata =
+                    modtime > r.embedding_time.unwrap_or(i64::MIN) || r.metadata.is_none(); // we don't store metadata acquisition time so assume it happens roughly when embedding does
                 if needs_embed || needs_ocr || needs_thumbnail || needs_metadata {
                     Some(FileRecord {
                         filename: filename.clone(),
-                        needs_embed, needs_ocr, needs_thumbnail, needs_metadata
+                        needs_embed,
+                        needs_ocr,
+                        needs_thumbnail,
+                        needs_metadata,
                     })
                 } else {
                     None
@@ -747,18 +924,22 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
             tracing::debug!("processing {}", record.filename);
             // we need to exit here to actually capture the error
             if !to_process_tx.send(record).await.is_ok() {
-                break
+                break;
             }
         }
     }
 
     drop(to_process_tx);
 
-    embedding_generation.await?.context("generating embeddings")?;
+    embedding_generation
+        .await?
+        .context("generating embeddings")?;
     metadata_writer.await?.context("writing metadata")?;
 
     if let Some(thumbnail_generation) = thumbnail_generation {
-        thumbnail_generation.await?.context("generating thumbnails")?;
+        thumbnail_generation
+            .await?
+            .context("generating thumbnails")?;
     }
 
     if let Some(ocr) = ocr {
@@ -767,7 +948,9 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
 
     image_loading.await?.context("loading images")?;
 
-    let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT filename FROM files").fetch_all(&pool).await?;
+    let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT filename FROM files")
+        .fetch_all(&pool)
+        .await?;
     let mut tx = pool.begin().await?;
     let video_meta = video_meta.read().await;
     for filename in stored {
@@ -781,11 +964,17 @@ async fn ingest_files(config: Arc<WConfig>) -> Result<()> {
                         .execute(&mut *tx)
                         .await?;
                 }
-            },
+            }
             // This might fail in some cases where for whatever reason a video is replaced with a file of the same name which is not a video. Don't do that.
             Filename::VideoFrame(container, frame) => {
                 // We don't necessarily have video lengths accessible, but any time a video is modified they will be available.
-                if !actual_filenames.contains_key(&container) || frame > video_meta.get(&container).map(|x| x.frames.unwrap()).unwrap_or(u32::MAX) {
+                if !actual_filenames.contains_key(&container)
+                    || frame
+                        > video_meta
+                            .get(&container)
+                            .map(|x| x.frames.unwrap())
+                            .unwrap_or(u32::MAX)
+                {
                     sqlx::query!("DELETE FROM files WHERE filename = ?", filename)
                         .execute(&mut *tx)
                         .await?;
@@ -820,12 +1009,16 @@ async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
     let pool = initialize_database(&config.service).await?;
 
     let mut index = IIndex {
-        vectors: scalar_quantizer::ScalarQuantizerIndexImpl::new(config.backend.embedding_size as u32, scalar_quantizer::QuantizerType::QT_fp16, faiss::MetricType::InnerProduct)?,
+        vectors: scalar_quantizer::ScalarQuantizerIndexImpl::new(
+            config.backend.embedding_size as u32,
+            scalar_quantizer::QuantizerType::QT_fp16,
+            faiss::MetricType::InnerProduct,
+        )?,
         embeddings: Vec::new(),
         filenames: Vec::new(),
         format_codes: Vec::new(),
         format_names: Vec::new(),
-        metadata: Vec::new()
+        metadata: Vec::new(),
     };
 
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
@@ -837,7 +1030,7 @@ async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
     let mut buffer = Vec::with_capacity(INDEX_ADD_BATCH * config.backend.embedding_size as usize);
     index.format_names = Vec::with_capacity(5);
     index.format_names.push(String::from("VIDEO"));
-    let video_format_code = 1<<0;
+    let video_format_code = 1 << 0;
 
     let mut rows = sqlx::query_as::<_, RawFileRecord>("SELECT * FROM files").fetch(&pool);
     while let Some(record) = rows.try_next().await? {
@@ -846,16 +1039,13 @@ async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
 
             let mut format_code = match parsed {
                 Filename::VideoFrame(_, _) => video_format_code,
-                _ => 0
+                _ => 0,
             };
 
             index.filenames.push(parsed);
             index.embeddings.push(emb.clone());
             for i in (0..emb.len()).step_by(2) {
-                buffer.push(
-                    half::f16::from_le_bytes([emb[i], emb[i + 1]])
-                        .to_f32(),
-                );
+                buffer.push(half::f16::from_le_bytes([emb[i], emb[i + 1]]).to_f32());
             }
             if buffer.len() == buffer.capacity() {
                 index.vectors.add(&buffer)?;
@@ -899,12 +1089,18 @@ async fn build_index(config: Arc<WConfig>) -> Result<IIndex> {
 }
 
 #[instrument(skip(index))]
-async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bool) -> Result<QueryResult<usize>> {
+async fn query_index(
+    index: &IIndex,
+    query: EmbeddingVector,
+    k: usize,
+    video: bool,
+) -> Result<QueryResult<usize>> {
     let result = index.vectors.search(&query, k as usize)?;
 
     let mut seen_videos = HashSet::new();
 
-    let items = result.distances
+    let items = result
+        .distances
         .into_iter()
         .zip(result.labels)
         .filter_map(|(distance, id)| {
@@ -914,7 +1110,7 @@ async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bo
                 (false, Filename::VideoFrame(_, _)) => return None,
                 (true, Filename::VideoFrame(container, _)) => {
                     if !seen_videos.insert(container) {
-                        return None
+                        return None;
                     }
                 }
             }
@@ -924,7 +1120,7 @@ async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bo
                 generate_filename_hash(&index.filenames[id as usize]).clone(),
                 index.format_codes[id],
                 index.metadata[id].as_ref().map(|x| (x.width, x.height)),
-                Some(id)
+                Some(id),
             ))
         })
         .collect();
@@ -937,7 +1133,13 @@ async fn query_index(index: &IIndex, query: EmbeddingVector, k: usize, video: bo
 }
 
 #[instrument(skip(config, client, index))]
-async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IIndex, req: QueryRequest, msgpack: bool) -> Result<Response<Body>> {
+async fn handle_request(
+    config: Arc<WConfig>,
+    client: Arc<Client>,
+    index: &RwLock<IIndex>,
+    req: QueryRequest,
+    msgpack: bool,
+) -> Result<Response<Body>> {
     let embedding = common::get_total_embedding(
         &req.terms,
         &config.backend,
@@ -945,15 +1147,25 @@ async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IInde
             query_clip_server(&client, &config.service.clip_server, "", batch).await
         },
         |image, config| async move {
-            let image = Arc::new(tokio::task::block_in_place(|| image::load_from_memory(&image))?);
-            Ok(serde_bytes::ByteBuf::from(resize_for_embed(config.backend.clone(), image).await?))
+            let image = Arc::new(tokio::task::block_in_place(|| {
+                image::load_from_memory(&image)
+            })?);
+            Ok(serde_bytes::ByteBuf::from(
+                resize_for_embed(config.backend.clone(), image).await?,
+            ))
         },
         &config.clone().predefined_embeddings,
         config.clone(),
-        (config.clone(), client.clone())).await?;
+        (config.clone(), client.clone()),
+    )
+    .await?;
 
+    // Do not pin the current index while waiting for the embedding server. In
+    // particular, a stalled request must not prevent an old index from being
+    // dropped after a reload has built its replacement.
+    let index = index.read().await;
     let k = req.k.unwrap_or(1000);
-    let qres = query_index(index, embedding, k, req.include_video).await?;
+    let qres = query_index(&index, embedding, k, req.include_video).await?;
 
     let mut extensions = HashMap::new();
     for (k, v) in image_formats(&config.service) {
@@ -961,25 +1173,67 @@ async fn handle_request(config: Arc<WConfig>, client: Arc<Client>, index: &IInde
     }
 
     if msgpack {
-        let matches = qres.matches.into_iter().map(|(score, filename, thumbnail, formats, dimensions, id)| {
-            let embedding = serde_bytes::ByteBuf::from(index.embeddings[id.expect("query results always contain an index id")].clone());
-            (score, filename, thumbnail, formats, dimensions, Option::<()>::None, embedding)
-        }).collect();
-        let result = QueryResultMsgpack { matches, formats: qres.formats, extensions };
+        let matches = qres
+            .matches
+            .into_iter()
+            .map(|(score, filename, thumbnail, formats, dimensions, id)| {
+                let embedding = serde_bytes::ByteBuf::from(
+                    index.embeddings[id.expect("query results always contain an index id")].clone(),
+                );
+                (
+                    score,
+                    filename,
+                    thumbnail,
+                    formats,
+                    dimensions,
+                    Option::<()>::None,
+                    embedding,
+                )
+            })
+            .collect();
+        let result = QueryResultMsgpack {
+            matches,
+            formats: qres.formats,
+            extensions,
+        };
         Ok(Response::builder()
             .header("Content-Type", "application/msgpack")
             .body(Body::from(rmp_serde::to_vec_named(&result)?))?)
     } else {
-        let matches = qres.matches.into_iter().map(|(score, filename, thumbnail, formats, dimensions, _id)| {
-            (score, filename, thumbnail, formats, dimensions, Option::<()>::None)
-        }).collect();
-        Ok(Json(QueryResult { matches, formats: qres.formats, extensions }).into_response())
+        let matches = qres
+            .matches
+            .into_iter()
+            .map(|(score, filename, thumbnail, formats, dimensions, _id)| {
+                (
+                    score,
+                    filename,
+                    thumbnail,
+                    formats,
+                    dimensions,
+                    Option::<()>::None,
+                )
+            })
+            .collect();
+        Ok(Json(QueryResult {
+            matches,
+            formats: qres.formats,
+            extensions,
+        })
+        .into_response())
     }
 }
 
 #[derive(Serialize)]
 struct QueryResultMsgpack {
-    matches: Vec<(f32, String, String, u64, Option<(u32, u32)>, Option<()>, serde_bytes::ByteBuf)>,
+    matches: Vec<(
+        f32,
+        String,
+        String,
+        u64,
+        Option<(u32, u32)>,
+        Option<()>,
+        serde_bytes::ByteBuf,
+    )>,
     formats: Vec<String>,
     extensions: HashMap<String, String>,
 }
@@ -998,28 +1252,32 @@ async fn main() -> Result<()> {
     {
         let db = initialize_database(&config).await?;
         let result = sqlx::query!("SELECT * FROM predefined_embeddings")
-            .fetch_all(&db).await?;
+            .fetch_all(&db)
+            .await?;
         for row in result {
-            predefined_embeddings.insert(row.name, ndarray::Array::from(decode_fp16_buffer(&row.embedding)));
+            predefined_embeddings.insert(
+                row.name,
+                ndarray::Array::from(decode_fp16_buffer(&row.embedding)),
+            );
         }
     }
 
     let config = Arc::new(WConfig {
         service: config,
         backend,
-        predefined_embeddings
+        predefined_embeddings,
     });
 
     if config.service.no_run_server {
         ingest_files(config.clone()).await?;
-        return Ok(())
+        return Ok(());
     }
 
     let (request_ingest_tx, mut request_ingest_rx) = mpsc::channel(1);
 
     let index = Arc::new(tokio::sync::RwLock::new(build_index(config.clone()).await?));
 
-    let (ingest_done_tx, _ingest_done_rx) = broadcast::channel(1);
+    let (ingest_done_tx, _) = broadcast::channel(1);
     let done_tx = Arc::new(ingest_done_tx.clone());
 
     let _ingest_task = tokio::spawn({
@@ -1028,26 +1286,26 @@ async fn main() -> Result<()> {
         async move {
             loop {
                 tracing::info!("Ingest running");
-                match ingest_files(config.clone()).await {
-                    Ok(_) => {
-                        match build_index(config.clone()).await {
-                            Ok(new_index) => {
-                                LAST_INDEX_SIZE.set(new_index.vectors.ntotal() as i64);
-                                *index.write().await = new_index;
-                                tracing::info!("Index loaded");
-                            }
-                            Err(e) => {
-                                tracing::error!("Index build failed: {:?}", e);
-                                ingest_done_tx.send((false, format!("{:?}", e))).unwrap();
-                            }
+                let status = match ingest_files(config.clone()).await {
+                    Ok(_) => match build_index(config.clone()).await {
+                        Ok(new_index) => {
+                            LAST_INDEX_SIZE.set(new_index.vectors.ntotal() as i64);
+                            *index.write().await = new_index;
+                            tracing::info!("Index loaded");
+                            (true, String::from("OK"))
                         }
-                    }
+                        Err(e) => {
+                            tracing::error!("Index build failed: {:?}", e);
+                            (false, format!("{:?}", e))
+                        }
+                    },
                     Err(e) => {
                         tracing::error!("Ingest failed: {:?}", e);
-                        ingest_done_tx.send((false, format!("{:?}", e))).unwrap();
+                        (false, format!("{:?}", e))
                     }
-                }
-                ingest_done_tx.send((true, format!("OK"))).unwrap();
+                };
+                // The initial ingest normally has no HTTP waiter.
+                let _ = ingest_done_tx.send(status);
                 RELOADS_COUNTER.inc();
                 request_ingest_rx.recv().await;
             }
@@ -1057,61 +1315,90 @@ async fn main() -> Result<()> {
     let cors = CorsLayer::permissive();
 
     let config_ = config.clone();
-    let client = Arc::new(Client::new());
+    let client = Arc::new(http_client()?);
     let index_ = index.clone();
     let config__ = config.clone();
     let app = Router::new()
-        .route("/", post(|headers: HeaderMap, body: axum::body::Bytes| async move {
-            let config = config.clone();
-            let index = index.read().await; // TODO: use ConcurrentIndex here
-            let client = client.clone();
-            QUERIES_COUNTER.inc();
-            let msgpack = headers.get(axum::http::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.split(';').next() == Some("application/msgpack"));
-            let req: QueryRequest = if msgpack {
-                rmp_serde::from_slice(&body).map_err(|e| format!("{:?}", e))?
-            } else {
-                serde_json::from_slice(&body).map_err(|e| format!("{:?}", e))?
-            };
-            handle_request(config, client.clone(), &index, req, msgpack).await.map_err(|e| format!("{:?}", e))
-        }).layer(DefaultBodyLimit::max(2<<24)))
-        .route("/", get(|_req: ()| async move {
-            Json(FrontendInit {
-                n_total: index_.read().await.vectors.ntotal(),
-                predefined_embedding_names: config__.predefined_embeddings.keys().cloned().collect(),
-                d_emb: config__.backend.embedding_size
+        .route(
+            "/",
+            post(|headers: HeaderMap, body: axum::body::Bytes| async move {
+                let config = config.clone();
+                let client = client.clone();
+                QUERIES_COUNTER.inc();
+                let msgpack = headers
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.split(';').next() == Some("application/msgpack"));
+                let req: QueryRequest = if msgpack {
+                    rmp_serde::from_slice(&body).map_err(|e| format!("{:?}", e))?
+                } else {
+                    serde_json::from_slice(&body).map_err(|e| format!("{:?}", e))?
+                };
+                handle_request(config, client.clone(), &index, req, msgpack)
+                    .await
+                    .map_err(|e| format!("{:?}", e))
             })
-        }))
-        .route("/reload", post(|_req: ()| async move {
-            tracing::info!("Requesting index reload");
-            let mut done_rx = done_tx.clone().subscribe();
-            let _ = request_ingest_tx.send(()).await; // ignore possible error, which is presumably because the queue is full
-            match done_rx.recv().await {
-                Ok((true, status)) => {
-                    let mut res = status.into_response();
-                    *res.status_mut() = StatusCode::OK;
-                    res
-                },
-                Ok((false, status)) => {
-                    let mut res = status.into_response();
+            .layer(DefaultBodyLimit::max(2 << 24)),
+        )
+        .route(
+            "/",
+            get(|_req: ()| async move {
+                Json(FrontendInit {
+                    n_total: index_.read().await.vectors.ntotal(),
+                    predefined_embedding_names: config__
+                        .predefined_embeddings
+                        .keys()
+                        .cloned()
+                        .collect(),
+                    d_emb: config__.backend.embedding_size,
+                })
+            }),
+        )
+        .route(
+            "/reload",
+            post(|_req: ()| async move {
+                tracing::info!("Requesting index reload");
+                let mut done_rx = done_tx.clone().subscribe();
+                // Coalesce reloads. Awaiting send() here allows an arbitrary number
+                // of HTTP handlers to pile up behind the bounded channel and then
+                // execute redundant full reloads one by one.
+                if matches!(
+                    request_ingest_tx.try_send(()),
+                    Err(mpsc::error::TrySendError::Closed(_))
+                ) {
+                    let mut res = "reload worker stopped".into_response();
                     *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                    res
-                },
-                Err(_) => {
-                    let mut res = "internal error".into_response();
-                    *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                    res
+                    return res;
                 }
-            }
-        }))
-        .route("/metrics", get(|_req: ()| async move {
-            let mut buffer = Vec::new();
-            let encoder = prometheus::TextEncoder::new();
-            let metric_families = prometheus::gather();
-            encoder.encode(&metric_families, &mut buffer).unwrap();
-            buffer
-        }))
+                match done_rx.recv().await {
+                    Ok((true, status)) => {
+                        let mut res = status.into_response();
+                        *res.status_mut() = StatusCode::OK;
+                        res
+                    }
+                    Ok((false, status)) => {
+                        let mut res = status.into_response();
+                        *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                        res
+                    }
+                    Err(_) => {
+                        let mut res = "internal error".into_response();
+                        *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                        res
+                    }
+                }
+            }),
+        )
+        .route(
+            "/metrics",
+            get(|_req: ()| async move {
+                let mut buffer = Vec::new();
+                let encoder = prometheus::TextEncoder::new();
+                let metric_families = prometheus::gather();
+                encoder.encode(&metric_families, &mut buffer).unwrap();
+                buffer
+            }),
+        )
         .layer(cors);
 
     let addr = format!("0.0.0.0:{}", config_.service.port);

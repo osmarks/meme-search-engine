@@ -1,34 +1,54 @@
 use anyhow::{anyhow, Context, Result};
 use common::resize_for_embed;
-use itertools::Itertools;
-use std::{collections::HashSet, ffi::OsStr, fs::{self, read_dir}, io::{BufRead, BufReader, BufWriter, Cursor}, path::PathBuf, str::FromStr, sync::Arc, time::Duration, hash::Hasher};
-use serde::{Serialize, Deserialize};
-use lazy_static::lazy_static;
-use regex::{bytes, Regex, RegexSet, RegexSetBuilder};
-use tokio::{sync::{mpsc::{self, Receiver}, Semaphore}, task::{JoinHandle, JoinSet}};
-use tokio_stream::wrappers::ReceiverStream;
-use reqwest::Client;
 use futures_util::stream::{StreamExt, TryStreamExt};
 use image::{DynamicImage, ImageReader};
+use itertools::Itertools;
+use lazy_static::lazy_static;
 use mimalloc::MiMalloc;
+use prometheus::{register_histogram_vec, register_int_counter, Encoder, HistogramVec, IntCounter};
+use regex::{bytes, Regex, RegexSet, RegexSetBuilder};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashSet,
+    ffi::OsStr,
+    fs::{self, read_dir},
+    hash::Hasher,
+    io::{BufRead, BufReader, BufWriter, Cursor},
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{
+    sync::{
+        mpsc::{self, Receiver},
+        Semaphore,
+    },
+    task::{JoinHandle, JoinSet},
+};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::instrument;
-use prometheus::{Encoder, register_int_counter, IntCounter, register_histogram_vec, HistogramVec};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 mod common;
 
-use crate::common::{get_backend_config, query_clip_server, EmbeddingRequest, OriginalImageMetadata, ProcessedEntry};
+use crate::common::{
+    get_backend_config, query_clip_server, EmbeddingRequest, OriginalImageMetadata, ProcessedEntry,
+};
 
-fn function_which_returns_some_na() -> Option<String> { Some(String::from("na")) }
+fn function_which_returns_some_na() -> Option<String> {
+    Some(String::from("na"))
+}
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
 #[serde(untagged)]
 enum BadTimestampFormat {
     Int(u64),
     String(String),
-    Float(f64) // *what* are they doing?
+    Float(f64), // *what* are they doing?
 }
 
 impl BadTimestampFormat {
@@ -36,7 +56,7 @@ impl BadTimestampFormat {
         match self {
             BadTimestampFormat::Int(x) => Ok(*x),
             BadTimestampFormat::String(x) => u64::from_str(&x).context("invalid string"),
-            BadTimestampFormat::Float(x) => Ok(*x as u64)
+            BadTimestampFormat::Float(x) => Ok(*x as u64),
         }
     }
 }
@@ -50,9 +70,9 @@ struct Entry {
     selftext: String,
     subreddit: Option<String>,
     created_utc: BadTimestampFormat,
-    #[serde(default="function_which_returns_some_na")]
+    #[serde(default = "function_which_returns_some_na")]
     post_hint: Option<String>,
-    id: String
+    id: String,
 }
 
 lazy_static! {
@@ -134,14 +154,18 @@ lazy_static! {
 }
 
 #[instrument(skip(tx))]
-fn process_file(path: PathBuf, tx: mpsc::Sender<Entry>, timestamp_threshold: Option<u64>) -> Result<()> {
+fn process_file(
+    path: PathBuf,
+    tx: mpsc::Sender<Entry>,
+    timestamp_threshold: Option<u64>,
+) -> Result<()> {
     let mut stream = zstd::stream::Decoder::new(fs::File::open(path)?)?;
     stream.window_log_max(31)?;
     let mut stream = BufReader::new(stream);
     let mut buf = Vec::new();
     loop {
         if stream.read_until(0x0A, &mut buf)? == 0 {
-            break
+            break;
         }
         // we would discard these later, but they have a different format so they can't be deserialized straight into Entries
         if OBJECT_HACKY_IGNORE.is_match(&buf) {
@@ -152,11 +176,19 @@ fn process_file(path: PathBuf, tx: mpsc::Sender<Entry>, timestamp_threshold: Opt
         let entry = match sonic_rs::serde::from_slice::<Entry>(buf.as_slice()) {
             Ok(x) => x,
             Err(e) => {
-                tracing::warn!("parse failed, please validate {:?} {:?}", e, String::from_utf8_lossy(&buf));
-                return Ok(())
+                tracing::warn!(
+                    "parse failed, please validate {:?} {:?}",
+                    e,
+                    String::from_utf8_lossy(&buf)
+                );
+                return Ok(());
             }
         };
-        if entry.selftext.is_empty() && !entry.over_18 && entry.author.is_some() && entry.subreddit.is_some() {
+        if entry.selftext.is_empty()
+            && !entry.over_18
+            && entry.author.is_some()
+            && entry.subreddit.is_some()
+        {
             if !URL_IGNORE.is_match(&entry.url) && URL_MUST_CONTAIN.is_match(&entry.url) {
                 match &entry.post_hint {
                     Some(x) if x == "na" || x == "image" => {
@@ -165,13 +197,15 @@ fn process_file(path: PathBuf, tx: mpsc::Sender<Entry>, timestamp_threshold: Opt
                             Some(threshold) => {
                                 let timestamp = entry.created_utc.to_u64().unwrap();
                                 timestamp > threshold
-                            },
-                            None => true
+                            }
+                            None => true,
                         };
 
-                        if after_threshold { tx.blocking_send(entry)?; }
-                    },
-                    _ => ()
+                        if after_threshold {
+                            tx.blocking_send(entry)?;
+                        }
+                    }
+                    _ => (),
                 }
             }
         }
@@ -190,12 +224,16 @@ struct Config {
     filename_threshold: Option<String>,
     metrics_addr: String,
     contact_info: String,
-    discard_hashes: HashSet<u64>
+    discard_hashes: HashSet<u64>,
 }
 
 #[instrument(skip(client, config))]
 #[async_recursion::async_recursion]
-async fn fetch_file(client: reqwest::Client, config: Arc<Config>, url: &str) -> Result<(Vec<u8>, String, String)> {
+async fn fetch_file(
+    client: reqwest::Client,
+    config: Arc<Config>,
+    url: &str,
+) -> Result<(Vec<u8>, String, String)> {
     let mut url = url.to_string();
     for (regex, replacement) in URL_REPLACEMENT_RULES.iter() {
         url = regex.replace_all(&url, *replacement).to_string();
@@ -211,13 +249,24 @@ async fn fetch_file(client: reqwest::Client, config: Arc<Config>, url: &str) -> 
     }
 
     let mut response = client.get(&*url).send().await?;
-    let content_type = std::str::from_utf8(&response.headers().get(reqwest::header::CONTENT_TYPE).context("no content type")?.as_bytes())?.to_owned();
-    if !(ACCEPTABLE_FILETYPES.contains(&content_type[..]) || (html_extract_rule.is_some() && content_type.starts_with("text/html"))) {
+    let content_type = std::str::from_utf8(
+        &response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .context("no content type")?
+            .as_bytes(),
+    )?
+    .to_owned();
+    if !(ACCEPTABLE_FILETYPES.contains(&content_type[..])
+        || (html_extract_rule.is_some() && content_type.starts_with("text/html")))
+    {
         return Err(anyhow!("invalid Content-Type"));
     }
     match response.content_length() {
-        Some(x) if x > (config.max_content_length as u64) => return Err(anyhow!("response too large")),
-        _ => ()
+        Some(x) if x > (config.max_content_length as u64) => {
+            return Err(anyhow!("response too large"))
+        }
+        _ => (),
     }
     let mut buffer = vec![];
     let mut hash = seahash::SeaHasher::new();
@@ -249,8 +298,13 @@ async fn fetch_file(client: reqwest::Client, config: Arc<Config>, url: &str) -> 
     Ok((buffer, content_type, response.url().to_string()))
 }
 
-fn write_output(config: Arc<Config>, mut rx: Receiver<ProcessedEntry>, seqnum: usize) -> Result<()> {
-    let mut out = fs::File::create(PathBuf::from(&config.output).join(format!("{}.dump-zst", seqnum)))?;
+fn write_output(
+    config: Arc<Config>,
+    mut rx: Receiver<ProcessedEntry>,
+    seqnum: usize,
+) -> Result<()> {
+    let mut out =
+        fs::File::create(PathBuf::from(&config.output).join(format!("{}.dump-zst", seqnum)))?;
     let stream = zstd::Encoder::new(&mut out, 15)?.auto_finish();
     let mut buf_stream = BufWriter::new(stream);
     while let Some(x) = rx.blocking_recv() {
@@ -263,7 +317,7 @@ fn write_output(config: Arc<Config>, mut rx: Receiver<ProcessedEntry>, seqnum: u
 enum OperatingMode {
     Count,
     Sample(f32),
-    FullRun
+    FullRun,
 }
 
 #[instrument]
@@ -274,15 +328,28 @@ fn readback_output(path: &str) -> Result<(u64, usize, usize)> {
     for entry in read_dir(path)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(OsStr::to_str).map(|x| x == "dump-zst").unwrap_or(false) {
-            let seqnum = path.file_stem().context("invalid file structure")?.to_str().context("non-UTF8 path")?.parse::<usize>().context("invalid file name")?;
+        if path
+            .extension()
+            .and_then(OsStr::to_str)
+            .map(|x| x == "dump-zst")
+            .unwrap_or(false)
+        {
+            let seqnum = path
+                .file_stem()
+                .context("invalid file structure")?
+                .to_str()
+                .context("non-UTF8 path")?
+                .parse::<usize>()
+                .context("invalid file name")?;
             highest_seqnum = Some(highest_seqnum.map(|x| x.max(seqnum)).unwrap_or(seqnum));
         }
     }
 
     let seqnum = highest_seqnum.context("no files found")?;
 
-    let stream = zstd::stream::Decoder::new(fs::File::open(PathBuf::from(path).join(&format!("{}.dump-zst", seqnum)))?)?;
+    let stream = zstd::stream::Decoder::new(fs::File::open(
+        PathBuf::from(path).join(&format!("{}.dump-zst", seqnum)),
+    )?)?;
     let mut stream = BufReader::new(stream);
     let mut latest_timestamp = 0;
     let mut count = 0;
@@ -293,21 +360,28 @@ fn readback_output(path: &str) -> Result<(u64, usize, usize)> {
         }
         match res {
             Ok(x) => latest_timestamp = latest_timestamp.max(x.timestamp),
-            Err(Error::InvalidDataRead(x)) | Err(Error::InvalidMarkerRead(x)) if x.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e).context("decode fail")
+            Err(Error::InvalidDataRead(x)) | Err(Error::InvalidMarkerRead(x))
+                if x.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break
+            }
+            Err(e) => return Err(e).context("decode fail"),
         }
     }
     Ok((latest_timestamp, count, seqnum))
 }
 
 async fn serve_metrics(config: Arc<Config>) -> Result<()> {
-    let metrics = axum::Router::new().route("/metrics", axum::routing::get(|| async move {
-        let mut buffer = Vec::new();
-        let encoder = prometheus::TextEncoder::new();
-        let metric_families = prometheus::gather();
-        encoder.encode(&metric_families, &mut buffer).unwrap();
-        buffer
-    }));
+    let metrics = axum::Router::new().route(
+        "/metrics",
+        axum::routing::get(|| async move {
+            let mut buffer = Vec::new();
+            let encoder = prometheus::TextEncoder::new();
+            let metric_families = prometheus::gather();
+            encoder.encode(&metric_families, &mut buffer).unwrap();
+            buffer
+        }),
+    );
     let listener = tokio::net::TcpListener::bind(&config.metrics_addr).await?;
     tokio::task::spawn(async move {
         let _ = axum::serve(listener, metrics).await;
@@ -322,7 +396,7 @@ async fn main() -> Result<()> {
     let cpus = num_cpus::get();
 
     let config = Arc::new(Config {
-        max_content_length: 1<<24,
+        max_content_length: 1 << 24,
         input: String::from("/srv/scratch/reddit_subs_202312/"),
         output: String::from("."),
         backend: String::from("http://localhost:1708"),
@@ -330,27 +404,32 @@ async fn main() -> Result<()> {
         filename_threshold: None,
         metrics_addr: String::from("0.0.0.0:9914"),
         contact_info: String::from("scraping-ops@osmarks.net"),
-        discard_hashes: [4168519401919155623, 4577010157274124110].into_iter().collect()
+        discard_hashes: [4168519401919155623, 4577010157274124110]
+            .into_iter()
+            .collect(),
     });
 
     serve_metrics(config.clone()).await?;
 
     let timestamp_threshold = match config.mode {
         OperatingMode::Count => None,
-        _ => {
-            match readback_output(&config.output) {
-                Ok(x) => Some(x),
-                Err(e) => {
-                    tracing::warn!("could not read output: {}", e);
-                    None
-                }
+        _ => match readback_output(&config.output) {
+            Ok(x) => Some(x),
+            Err(e) => {
+                tracing::warn!("could not read output: {}", e);
+                None
             }
-        }
+        },
     };
 
     let mut seqnum = 0;
     if let Some((threshold, count, existing_seqnum)) = timestamp_threshold {
-        tracing::info!("threshold is {}, {} items, seq {}", threshold, count, existing_seqnum);
+        tracing::info!(
+            "threshold is {}, {} items, seq {}",
+            threshold,
+            count,
+            existing_seqnum
+        );
         seqnum = existing_seqnum + 1;
     }
 
@@ -363,7 +442,12 @@ async fn main() -> Result<()> {
     let (resized_tx, resized_rx) = mpsc::channel(backend.batch);
     let (final_write_tx, final_write_rx) = mpsc::channel::<ProcessedEntry>(32768);
     let client = Client::builder()
-        .user_agent(format!("{}/{} (contact {})", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), config.contact_info))
+        .user_agent(format!(
+            "{}/{} (contact {})",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION"),
+            config.contact_info
+        ))
         .timeout(Duration::from_secs(30))
         .build()?;
 
@@ -380,31 +464,33 @@ async fn main() -> Result<()> {
             let client = client.clone();
             let config = config.clone();
             let stream = ReceiverStream::new(entries_rx);
-            stream.map(Ok).try_for_each_concurrent(Some(512), move |entry| {
-                let client = client.clone();
-                let config = config.clone();
-                let buffers_tx = buffers_tx.clone();
-                async move {
-                    if let OperatingMode::Sample(rate) = config.mode {
-                        if fastrand::f32() > rate {
-                            return Ok(())
+            stream
+                .map(Ok)
+                .try_for_each_concurrent(Some(512), move |entry| {
+                    let client = client.clone();
+                    let config = config.clone();
+                    let buffers_tx = buffers_tx.clone();
+                    async move {
+                        if let OperatingMode::Sample(rate) = config.mode {
+                            if fastrand::f32() > rate {
+                                return Ok(());
+                            }
                         }
-                    }
-                    match fetch_file(client, config.clone(), &entry.url).await {
-                        Ok(buf) => {
-                            IMAGES_FETCHED_COUNTER.inc();
-                            tracing::debug!("got {}", &entry.url);
-                            buffers_tx.send((entry, buf)).await?;
-                        },
-                        Err(e) => {
-                            IMAGES_FAILED_COUNTER.inc();
-                            tracing::debug!("{} failed: {}", &entry.url, e)
+                        match fetch_file(client, config.clone(), &entry.url).await {
+                            Ok(buf) => {
+                                IMAGES_FETCHED_COUNTER.inc();
+                                tracing::debug!("got {}", &entry.url);
+                                buffers_tx.send((entry, buf)).await?;
+                            }
+                            Err(e) => {
+                                IMAGES_FAILED_COUNTER.inc();
+                                tracing::debug!("{} failed: {}", &entry.url, e)
+                            }
                         }
+                        Ok(())
                     }
-                    Ok(())
-                }
-            }
-        )})
+                })
+        }),
     };
 
     let resize_task = match config.mode {
@@ -412,38 +498,46 @@ async fn main() -> Result<()> {
         _ => Some(tokio::task::spawn({
             let stream = ReceiverStream::new(buffers_rx);
             let backend = backend.clone();
-            stream.map(Ok).try_for_each_concurrent(Some(cpus), move |(entry, (buffer, mime_type, final_url))| {
-                let backend = backend.clone();
-                let size = buffer.len();
-                IMAGE_FILESIZES_HISTOGRAM.with_label_values(&[&mime_type]).observe(size as f64);
-                let resized_tx = resized_tx.clone();
-                async move {
-                    let image_result = tokio::task::spawn_blocking(|| {
-                        let csr = Cursor::new(buffer);
-                        let image = ImageReader::new(csr).with_guessed_format()?.decode()?;
-                        Result::<DynamicImage, anyhow::Error>::Ok(image)
-                    }).await?;
-                    let image = match image_result {
-                        Ok(image) => image,
-                        Err(e) => {
-                            tracing::debug!("loading {} failed: {}", entry.url, e);
-                            return Result::<(), anyhow::Error>::Ok(());
-                        }
-                    };
-                    let dim = (image.width(), image.height());
-                    IMAGE_PIXELS_HISTOGRAM.with_label_values(&[&mime_type]).observe(dim.0 as f64 * dim.1 as f64);
-                    let metadata = OriginalImageMetadata {
-                        mime_type,
-                        original_file_size: size,
-                        dimension: dim,
-                        final_url
-                    };
-                    let resized = resize_for_embed(backend.clone(), image).await?;
-                    resized_tx.send((entry, resized, metadata)).await?;
-                    Ok(())
-                }
-            })
-        }))
+            stream.map(Ok).try_for_each_concurrent(
+                Some(cpus),
+                move |(entry, (buffer, mime_type, final_url))| {
+                    let backend = backend.clone();
+                    let size = buffer.len();
+                    IMAGE_FILESIZES_HISTOGRAM
+                        .with_label_values(&[&mime_type])
+                        .observe(size as f64);
+                    let resized_tx = resized_tx.clone();
+                    async move {
+                        let image_result = tokio::task::spawn_blocking(|| {
+                            let csr = Cursor::new(buffer);
+                            let image = ImageReader::new(csr).with_guessed_format()?.decode()?;
+                            Result::<DynamicImage, anyhow::Error>::Ok(image)
+                        })
+                        .await?;
+                        let image = match image_result {
+                            Ok(image) => image,
+                            Err(e) => {
+                                tracing::debug!("loading {} failed: {}", entry.url, e);
+                                return Result::<(), anyhow::Error>::Ok(());
+                            }
+                        };
+                        let dim = (image.width(), image.height());
+                        IMAGE_PIXELS_HISTOGRAM
+                            .with_label_values(&[&mime_type])
+                            .observe(dim.0 as f64 * dim.1 as f64);
+                        let metadata = OriginalImageMetadata {
+                            mime_type,
+                            original_file_size: size,
+                            dimension: dim,
+                            final_url,
+                        };
+                        let resized = resize_for_embed(backend.clone(), image).await?;
+                        resized_tx.send((entry, resized, metadata)).await?;
+                        Ok(())
+                    }
+                },
+            )
+        })),
     };
 
     let embedding_generation_task: Option<JoinHandle<Result<()>>> = match config.mode {
@@ -453,45 +547,60 @@ async fn main() -> Result<()> {
             let client = client.clone();
             let config = config.clone();
             // keep multiple embedding requests in flight
-            stream.map(Ok).try_for_each_concurrent(Some(3), move |batch| {
-                let (entries, bytes, batch_dimensions): (Vec<Entry>, Vec<Vec<u8>>, Vec<OriginalImageMetadata>) = batch.into_iter().multiunzip();
-                let client = client.clone();
-                let config = config.clone();
-                let final_write_tx = final_write_tx.clone();
-                async move {
-                    let result: Vec<serde_bytes::ByteBuf> = query_clip_server(
-                        &client,
-                        &config.backend,
-                        "",
-                        EmbeddingRequest::Images {
-                            images: bytes.into_iter().map(serde_bytes::ByteBuf::from).collect(),
-                        },
-                    ).await.context("querying CLIP server")?;
+            stream
+                .map(Ok)
+                .try_for_each_concurrent(Some(3), move |batch| {
+                    let (entries, bytes, batch_dimensions): (
+                        Vec<Entry>,
+                        Vec<Vec<u8>>,
+                        Vec<OriginalImageMetadata>,
+                    ) = batch.into_iter().multiunzip();
+                    let client = client.clone();
+                    let config = config.clone();
+                    let final_write_tx = final_write_tx.clone();
+                    async move {
+                        let result: Vec<serde_bytes::ByteBuf> = query_clip_server(
+                            &client,
+                            &config.backend,
+                            "",
+                            EmbeddingRequest::Images {
+                                images: bytes.into_iter().map(serde_bytes::ByteBuf::from).collect(),
+                            },
+                        )
+                        .await
+                        .context("querying CLIP server")?;
 
-                    for (vector, entry,
-                        metadata) in itertools::izip!(result.into_iter(), entries, batch_dimensions) {
-                        final_write_tx.send(ProcessedEntry {
-                            url: entry.url,
-                            id: entry.id,
-                            title: entry.title,
-                            subreddit: entry.subreddit.unwrap(),
-                            author: entry.author.unwrap(),
-                            embedding: vector.into_vec(),
-                            timestamp: entry.created_utc.to_u64()?,
-                            metadata
-                        }).await?;
-                        IMAGES_PROCESSED_COUNTER.inc();
+                        for (vector, entry, metadata) in
+                            itertools::izip!(result.into_iter(), entries, batch_dimensions)
+                        {
+                            final_write_tx
+                                .send(ProcessedEntry {
+                                    url: entry.url,
+                                    id: entry.id,
+                                    title: entry.title,
+                                    subreddit: entry.subreddit.unwrap(),
+                                    author: entry.author.unwrap(),
+                                    embedding: vector.into_vec(),
+                                    timestamp: entry.created_utc.to_u64()?,
+                                    metadata,
+                                })
+                                .await?;
+                            IMAGES_PROCESSED_COUNTER.inc();
+                        }
+                        anyhow::Result::Ok(())
                     }
-                    anyhow::Result::Ok(())
-                }
-            })
-        }))
+                })
+        })),
     };
 
     let config_ = config.clone();
     let output_writer_task = match config.mode {
-        OperatingMode::Sample(_) | OperatingMode::FullRun => Some(tokio::task::spawn_blocking(move || write_output(config_, final_write_rx, seqnum))),
-        _ => None
+        OperatingMode::Sample(_) | OperatingMode::FullRun => {
+            Some(tokio::task::spawn_blocking(move || {
+                write_output(config_, final_write_rx, seqnum)
+            }))
+        }
+        _ => None,
     };
 
     tracing::info!("working...");
@@ -499,10 +608,15 @@ async fn main() -> Result<()> {
     let mut paths = vec![];
     for file in fs::read_dir(&config.input)? {
         let path = file?.path();
-        let last_segment = path.file_name().context("invalid file structure")?.to_str().context("non-UTF8 path")?.to_string();
+        let last_segment = path
+            .file_name()
+            .context("invalid file structure")?
+            .to_str()
+            .context("non-UTF8 path")?
+            .to_string();
         match &config.filename_threshold {
             Some(threshold) if threshold >= &last_segment => (),
-            _ => paths.push(path)
+            _ => paths.push(path),
         }
     }
 
@@ -512,7 +626,7 @@ async fn main() -> Result<()> {
 
     let readers = match config.mode {
         OperatingMode::Count | OperatingMode::Sample(_) => cpus,
-        OperatingMode::FullRun => 1
+        OperatingMode::FullRun => 1,
     };
 
     let semaphore = Arc::new(Semaphore::new(readers));
@@ -526,7 +640,7 @@ async fn main() -> Result<()> {
         file_readers.spawn_blocking(move || {
             match process_file(path_, entries_tx, timestamp_threshold.map(|(x, _, _)| x)) {
                 Ok(_) => (),
-                Err(e) => tracing::error!("could not parse {:?} {:?}", &path, e)
+                Err(e) => tracing::error!("could not parse {:?} {:?}", &path, e),
             }
             std::mem::drop(permit);
         });
@@ -538,9 +652,15 @@ async fn main() -> Result<()> {
 
     std::mem::drop(entries_tx);
     println!("{:?}", load_task.await?);
-    if let Some(task) = resize_task { println!("resize: {:?}", task.await?); }
-    if let Some(task) = embedding_generation_task { println!("embedding: {:?}", task.await?) };
-    if let Some(task) = output_writer_task { println!("output: {:?}", task.await?) };
+    if let Some(task) = resize_task {
+        println!("resize: {:?}", task.await?);
+    }
+    if let Some(task) = embedding_generation_task {
+        println!("embedding: {:?}", task.await?)
+    };
+    if let Some(task) = output_writer_task {
+        println!("output: {:?}", task.await?)
+    };
 
     Ok(())
 }

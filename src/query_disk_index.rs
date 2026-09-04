@@ -1,56 +1,69 @@
 use anyhow::{Context, Result};
-use lazy_static::lazy_static;
-use monoio::{blocking::DefaultThreadPool, fs};
-use std::path::PathBuf;
-use base64::Engine;
 use argh::FromArgs;
-use itertools::Itertools;
+use base64::Engine;
+use diskann::{
+    vector::{fast_dot_noprefetch, scale_dot_result, scale_dot_result_f64, QueryLUT, SCALE_F64},
+    NeighbourBuffer,
+};
 use foldhash::{HashSet, HashSetExt};
 use half::f16;
-use diskann::{NeighbourBuffer, vector::{fast_dot_noprefetch, QueryLUT, scale_dot_result, scale_dot_result_f64, SCALE_F64}};
-use simsimd::SpatialSimilarity;
-use memmap2::{Mmap, MmapOptions};
-use std::rc::Rc;
-use monoio::net::{TcpListener, TcpStream};
-use monoio::io::IntoPollIo;
-use hyper::{body::{Body, Bytes, Incoming, Frame}, server::conn::http1, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Empty, Full};
-use prometheus::{register_int_counter, register_int_counter_vec, register_int_gauge, Encoder, IntCounter, IntGauge, IntCounterVec};
-use std::pin::Pin;
-use std::future::Future;
-use serde::{Serialize, Deserialize};
-use std::str::FromStr;
+use hyper::{
+    body::{Body, Bytes, Frame, Incoming},
+    server::conn::http1,
+    Method, Request, Response, StatusCode,
+};
+use itertools::Itertools;
+use lazy_static::lazy_static;
+use memmap2::{Mmap, MmapOptions};
+use monoio::io::IntoPollIo;
+use monoio::net::{TcpListener, TcpStream};
+use monoio::{blocking::DefaultThreadPool, fs};
+use prometheus::{
+    register_int_counter, register_int_counter_vec, register_int_gauge, Encoder, IntCounter,
+    IntCounterVec, IntGauge,
+};
+use serde::{Deserialize, Serialize};
+use simsimd::SpatialSimilarity;
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Write;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::str::FromStr;
 use std::sync::Arc;
 
 mod common;
 
-use common::{resize_for_embed_sync, QueryTerm, FrontendInit, IndexHeader, InferenceServerConfig, PackedIndexEntry, QueryRequest, QueryResult};
+use common::{
+    resize_for_embed_sync, FrontendInit, IndexHeader, InferenceServerConfig, PackedIndexEntry,
+    QueryRequest, QueryResult, QueryTerm,
+};
 
 #[derive(FromArgs, Clone)]
-#[argh(description="Query disk index")]
+#[argh(description = "Query disk index")]
 struct CLIArguments {
     #[argh(positional)]
     index_path: String,
-    #[argh(option, short='q', description="query vector in base64")]
+    #[argh(option, short = 'q', description = "query vector in base64")]
     query_vector_base64: Option<String>,
-    #[argh(option, short='f', description="file of FP16 query vectors")]
+    #[argh(option, short = 'f', description = "file of FP16 query vectors")]
     query_vector_file: Option<String>,
-    #[argh(switch, short='v', description="verbose")]
+    #[argh(switch, short = 'v', description = "verbose")]
     verbose: bool,
-    #[argh(option, short='n', description="stop at n queries")]
+    #[argh(option, short = 'n', description = "stop at n queries")]
     n: Option<usize>,
-    #[argh(option, short='L', description="search list size")]
+    #[argh(option, short = 'L', description = "search list size")]
     search_list_size: Option<usize>,
-    #[argh(switch, description="always use full-precision vectors (slow)")]
+    #[argh(switch, description = "always use full-precision vectors (slow)")]
     disable_pq: bool,
-    #[argh(option, short='c', description="server config file")]
+    #[argh(option, short = 'c', description = "server config file")]
     config_path: Option<String>,
-    #[argh(switch, short='l', description="lock memory")]
+    #[argh(switch, short = 'l', description = "lock memory")]
     lock_memory: bool,
-    #[argh(option, short='T', description="number of threads to use")]
-    threads: Option<usize>
+    #[argh(option, short = 'T', description = "number of threads to use")]
+    threads: Option<usize>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -60,14 +73,19 @@ struct ServerConfig {
     descriptor_names: Vec<String>,
     telemetry_file: String,
     search_list: usize,
-    beam_width: usize
+    beam_width: usize,
 }
 
 lazy_static! {
-    static ref QUERIES_COUNTER: IntCounter = register_int_counter!("mse_queries", "queries executed").unwrap();
-    static ref TERMS_COUNTER: IntCounterVec = register_int_counter_vec!("mse_terms", "terms used in queries, by type", &["type"]).unwrap();
-    static ref NODE_READS: IntCounter = register_int_counter!("mse_node_reads", "graph nodes read").unwrap();
-    static ref PQ_COMPARISONS: IntCounter = register_int_counter!("mse_pq_comparisons", "product quantization comparisons").unwrap();
+    static ref QUERIES_COUNTER: IntCounter =
+        register_int_counter!("mse_queries", "queries executed").unwrap();
+    static ref TERMS_COUNTER: IntCounterVec =
+        register_int_counter_vec!("mse_terms", "terms used in queries, by type", &["type"])
+            .unwrap();
+    static ref NODE_READS: IntCounter =
+        register_int_counter!("mse_node_reads", "graph nodes read").unwrap();
+    static ref PQ_COMPARISONS: IntCounter =
+        register_int_counter!("mse_pq_comparisons", "product quantization comparisons").unwrap();
 }
 
 async fn read_node<'a>(id: u32, index: Rc<Index>) -> Result<PackedIndexEntry> {
@@ -77,7 +95,7 @@ async fn read_node<'a>(id: u32, index: Rc<Index>) -> Result<PackedIndexEntry> {
     res?;
     NODE_READS.inc();
     let len = u16::from_le_bytes(buf[0..2].try_into().unwrap()) as usize;
-    Ok(bitcode::decode(&buf[2..len+2])?)
+    Ok(bitcode::decode(&buf[2..len + 2])?)
 }
 
 fn next_several_unvisited(s: &mut NeighbourBuffer, n: usize) -> Option<Vec<u32>> {
@@ -100,7 +118,7 @@ const DUPLICATES_THRESHOLD: f32 = 0.95;
 
 fn read_pq_codes(id: u32, index: Rc<Index>, buf: &mut Vec<u8>) {
     let loc = (id as usize) * index.pq_code_size;
-    buf.extend(&index.memory_maps.pq_codes[loc..loc+index.pq_code_size])
+    buf.extend(&index.memory_maps.pq_codes[loc..loc + index.pq_code_size])
 }
 
 struct VisitedNode {
@@ -111,7 +129,7 @@ struct VisitedNode {
     score: i64,
     timestamp: u64,
     dimensions: (u32, u32),
-    embedding: Vec<u8>
+    embedding: Vec<u8>,
 }
 
 struct Scratch {
@@ -120,7 +138,7 @@ struct Scratch {
     neighbour_buffer: NeighbourBuffer,
     neighbour_pre_buffer: Vec<u32>,
     visited_list: Vec<VisitedNode>,
-    visited_embeddings: Vec<f32>
+    visited_embeddings: Vec<f32>,
 }
 
 struct Index {
@@ -128,7 +146,7 @@ struct Index {
     header: Rc<IndexHeader>,
     pq_code_size: usize,
     n_descriptors: usize,
-    memory_maps: Arc<MemoryMaps>
+    memory_maps: Arc<MemoryMaps>,
 }
 
 struct DescriptorScales(Vec<f32>);
@@ -137,12 +155,23 @@ fn descriptor_product(index: Rc<Index>, scales: &DescriptorScales, neighbour: u3
     let mut result = 0;
     // effectively an extra part of the vector to dot product
     for (j, d) in scales.0.iter().enumerate() {
-        result += scale_dot_result(d * index.memory_maps.descriptors[neighbour as usize * index.n_descriptors + j] as f32);
+        result += scale_dot_result(
+            d * index.memory_maps.descriptors[neighbour as usize * index.n_descriptors + j] as f32,
+        );
     }
     result
 }
 
-async fn greedy_search<'a>(scratch: &mut Scratch, start: u32, query: &[f16], query_preprocessed: &QueryLUT, descriptor_scales: &DescriptorScales, index: Rc<Index>, disable_pq: bool, beamwidth: usize) -> Result<(usize, usize)> {
+async fn greedy_search<'a>(
+    scratch: &mut Scratch,
+    start: u32,
+    query: &[f16],
+    query_preprocessed: &QueryLUT,
+    descriptor_scales: &DescriptorScales,
+    index: Rc<Index>,
+    disable_pq: bool,
+    beamwidth: usize,
+) -> Result<(usize, usize)> {
     scratch.visited_adjacent.clear();
     scratch.neighbour_buffer.clear();
     scratch.visited_list.clear();
@@ -179,20 +208,28 @@ async fn greedy_search<'a>(scratch: &mut Scratch, start: u32, query: &[f16], que
                     score,
                     timestamp: node.timestamp,
                     dimensions: node.dimensions,
-                    embedding: node.vector.iter().flat_map(|x| x.to_le_bytes()).collect()
+                    embedding: node.vector.iter().flat_map(|x| x.to_le_bytes()).collect(),
                 });
-                scratch.visited_embeddings.extend(bytemuck::cast_slice(&node.vector).iter().map(|x: &f16| x.to_f32()));
+                scratch.visited_embeddings.extend(
+                    bytemuck::cast_slice(&node.vector)
+                        .iter()
+                        .map(|x: &f16| x.to_f32()),
+                );
             };
             for &neighbour in node.vertices.iter() {
                 if scratch.visited_adjacent.insert(neighbour) {
                     scratch.neighbour_pre_buffer.push(neighbour);
                 }
             }
-            let mut pq_codes = Vec::with_capacity(index.pq_code_size * scratch.neighbour_pre_buffer.len());
+            let mut pq_codes =
+                Vec::with_capacity(index.pq_code_size * scratch.neighbour_pre_buffer.len());
             for &neighbour in scratch.neighbour_pre_buffer.iter() {
                 read_pq_codes(neighbour, index.clone(), &mut pq_codes);
             }
-            let mut approx_scores = index.header.quantizer.asymmetric_dot_product(&query_preprocessed, &pq_codes);
+            let mut approx_scores = index
+                .header
+                .quantizer
+                .asymmetric_dot_product(&query_preprocessed, &pq_codes);
             for (i, &neighbour) in scratch.neighbour_pre_buffer.iter().enumerate() {
                 if disable_pq {
                     let node = read_node(neighbour, index.clone()).await?;
@@ -201,7 +238,8 @@ async fn greedy_search<'a>(scratch: &mut Scratch, start: u32, query: &[f16], que
                     score += descriptor_product(index.clone(), &descriptor_scales, neighbour);
                     scratch.neighbour_buffer.insert(neighbour, score);
                 } else {
-                    approx_scores[i] += descriptor_product(index.clone(), &descriptor_scales, neighbour);
+                    approx_scores[i] +=
+                        descriptor_product(index.clone(), &descriptor_scales, neighbour);
                     scratch.neighbour_buffer.insert(neighbour, approx_scores[i]);
                     pq_cmps += 1;
                     PQ_COMPARISONS.inc();
@@ -218,13 +256,21 @@ fn summary_stats(ranks: &mut [usize]) {
     let mean = sum as f64 / ranks.len() as f64 + 1.0;
     ranks.sort_unstable();
     let median = ranks[ranks.len() / 2] + 1;
-    let harmonic_mean = ranks.iter().map(|x| 1.0 / ((x+1) as f64)).sum::<f64>() / ranks.len() as f64;
-    println!("median {} mean {:.2} max {} min {} harmonic mean {:.2}", median, mean, ranks[ranks.len() - 1] + 1, ranks[0] + 1, 1.0 / harmonic_mean);
+    let harmonic_mean =
+        ranks.iter().map(|x| 1.0 / ((x + 1) as f64)).sum::<f64>() / ranks.len() as f64;
+    println!(
+        "median {} mean {:.2} max {} min {} harmonic mean {:.2}",
+        median,
+        mean,
+        ranks[ranks.len() - 1] + 1,
+        ranks[0] + 1,
+        1.0 / harmonic_mean
+    );
 }
 
 const K: usize = 20;
 
-#[monoio::main(threads=1)]
+#[monoio::main(threads = 1)]
 async fn evaluate(args: Arc<CLIArguments>, memory_maps: Arc<MemoryMaps>) -> Result<()> {
     let index = initialize_index(args.clone(), memory_maps).await?;
     let mut top_k_ranks_best_shard = vec![];
@@ -236,12 +282,21 @@ async fn evaluate(args: Arc<CLIArguments>, memory_maps: Arc<MemoryMaps>) -> Resu
     let mut queries = vec![];
 
     if let Some(query_vector_base64) = &args.query_vector_base64 {
-        let query_vector: Vec<f16> = common::chunk_fp16_buffer(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(query_vector_base64.as_bytes()).context("invalid base64")?);
+        let query_vector: Vec<f16> = common::chunk_fp16_buffer(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(query_vector_base64.as_bytes())
+                .context("invalid base64")?,
+        );
         queries.push(query_vector);
     }
     if let Some(query_vector_file) = &args.query_vector_file {
         let query_vectors = fs::read(query_vector_file).await?;
-        queries.extend(common::chunk_fp16_buffer(&query_vectors).chunks(1152).map(|x| x.to_vec()).collect::<Vec<_>>());
+        queries.extend(
+            common::chunk_fp16_buffer(&query_vectors)
+                .chunks(1152)
+                .map(|x| x.to_vec())
+                .collect::<Vec<_>>(),
+        );
     }
 
     if let Some(n) = args.n {
@@ -249,13 +304,21 @@ async fn evaluate(args: Arc<CLIArguments>, memory_maps: Arc<MemoryMaps>) -> Resu
     }
 
     for query_vector in queries.iter() {
-        let query_vector_fp32 = query_vector.iter().map(|x| x.to_f32()).collect::<Vec<f32>>();
+        let query_vector_fp32 = query_vector
+            .iter()
+            .map(|x| x.to_f32())
+            .collect::<Vec<f32>>();
         let query_preprocessed = index.header.quantizer.preprocess_query(&query_vector_fp32);
 
         // TODO slightly dubious
-        let selected_shard = index.header.shards.iter().position_max_by_key(|x| {
-            scale_dot_result_f64(SpatialSimilarity::dot(&x.0, &query_vector_fp32).unwrap())
-        }).unwrap();
+        let selected_shard = index
+            .header
+            .shards
+            .iter()
+            .position_max_by_key(|x| {
+                scale_dot_result_f64(SpatialSimilarity::dot(&x.0, &query_vector_fp32).unwrap())
+            })
+            .unwrap();
 
         if args.verbose {
             println!("selected shard is {}", selected_shard);
@@ -267,11 +330,20 @@ async fn evaluate(args: Arc<CLIArguments>, memory_maps: Arc<MemoryMaps>) -> Resu
             let node = read_node(i, index.clone()).await?;
             //println!("{} {}", i, node.url);
             let vector = bytemuck::cast_slice(&node.vector);
-            matches.push((i, fast_dot_noprefetch(&query_vector, &vector), node.url, node.shards));
+            matches.push((
+                i,
+                fast_dot_noprefetch(&query_vector, &vector),
+                node.url,
+                node.shards,
+            ));
         }
 
         matches.sort_unstable_by_key(|x| -x.1);
-        let mut matches = matches.into_iter().enumerate().map(|(i, (id, distance, url, shards))| (id, i)).collect::<Vec<_>>();
+        let mut matches = matches
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, distance, url, shards))| (id, i))
+            .collect::<Vec<_>>();
         matches.sort_unstable();
 
         /*for (id, distance, url, shards) in matches.iter().take(20) {
@@ -291,12 +363,22 @@ async fn evaluate(args: Arc<CLIArguments>, memory_maps: Arc<MemoryMaps>) -> Resu
                 neighbour_pre_buffer: Vec::new(),
                 visited_list: Vec::new(),
                 visited_adjacent: HashSet::new(),
-                visited_embeddings: Vec::new()
+                visited_embeddings: Vec::new(),
             };
 
             let descriptor_scales = DescriptorScales(vec![0.0, 0.0, 0.0, 0.0]);
 
-            let cmps_result = greedy_search(&mut scratch, selected_start, &query_vector, &query_preprocessed, &descriptor_scales, index.clone(), args.disable_pq, beamwidth).await?;
+            let cmps_result = greedy_search(
+                &mut scratch,
+                selected_start,
+                &query_vector,
+                &query_preprocessed,
+                &descriptor_scales,
+                index.clone(),
+                args.disable_pq,
+                beamwidth,
+            )
+            .await?;
 
             // slightly dubious because this is across shards
             pq_cmps.push(cmps_result.1);
@@ -310,14 +392,24 @@ async fn evaluate(args: Arc<CLIArguments>, memory_maps: Arc<MemoryMaps>) -> Resu
             for (i, node) in scratch.visited_list.iter().take(20).enumerate() {
                 let found_id = match matches.binary_search(&(node.id, 0)) {
                     Ok(pos) => pos,
-                    Err(pos) => pos
+                    Err(pos) => pos,
                 };
                 if args.verbose {
-                    println!("index scan: {} {} {} {:?} {:?}; rank {}", node.id, node.score, node.image_url, node.shards, node.scores, matches[found_id].1 + 1);
+                    println!(
+                        "index scan: {} {} {} {:?} {:?}; rank {}",
+                        node.id,
+                        node.score,
+                        node.image_url,
+                        node.shards,
+                        node.scores,
+                        matches[found_id].1 + 1
+                    );
                 };
                 top_ranks[i] = std::cmp::min(top_ranks[i], matches[found_id].1);
             }
-            if args.verbose { println!("") }
+            if args.verbose {
+                println!("")
+            }
         }
 
         // results list is always correctly sorted
@@ -339,18 +431,31 @@ async fn evaluate(args: Arc<CLIArguments>, memory_maps: Arc<MemoryMaps>) -> Resu
     summary_stats(&mut pq_cmps);
     println!("comparisons:");
     summary_stats(&mut cmps);
-    println!("recall@{}: {}", K, recall_total as f64 / (K * queries.len()) as f64);
+    println!(
+        "recall@{}: {}",
+        K,
+        recall_total as f64 / (K * queries.len()) as f64
+    );
 
     Ok(())
 }
 
-pub async fn query_clip_server<I, O>(base_url: &str, path: &str, data: Option<I>) -> Result<O> where I: Serialize, O: serde::de::DeserializeOwned {
+pub async fn query_clip_server<I, O>(base_url: &str, path: &str, data: Option<I>) -> Result<O>
+where
+    I: Serialize,
+    O: serde::de::DeserializeOwned,
+{
     // TODO connection pool or something
     // also this won't work over TLS
 
     let url = hyper::Uri::from_str(base_url)?;
 
-    let stream = TcpStream::connect(format!("{}:{}", url.host().unwrap(), url.port_u16().unwrap_or(80))).await?;
+    let stream = TcpStream::connect(format!(
+        "{}:{}",
+        url.host().unwrap(),
+        url.port_u16().unwrap_or(80)
+    ))
+    .await?;
     let io = monoio_compat::hyper::MonoioIo::new(stream.into_poll_io()?);
 
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
@@ -368,8 +473,19 @@ pub async fn query_clip_server<I, O>(base_url: &str, path: &str, data: Option<I>
         .header(hyper::header::CONTENT_TYPE, "application/msgpack");
 
     let res = match data {
-        Some(data) => sender.send_request(req.method(Method::POST).body(Full::new(Bytes::from(rmp_serde::to_vec_named(&data)?)))?).await?,
-        None => sender.send_request(req.method(Method::GET).body(Full::new(Bytes::from("")))?).await?
+        Some(data) => {
+            sender
+                .send_request(
+                    req.method(Method::POST)
+                        .body(Full::new(Bytes::from(rmp_serde::to_vec_named(&data)?)))?,
+                )
+                .await?
+        }
+        None => {
+            sender
+                .send_request(req.method(Method::GET).body(Full::new(Bytes::from("")))?)
+                .await?
+        }
     };
 
     if res.status() != StatusCode::OK {
@@ -384,13 +500,13 @@ pub async fn query_clip_server<I, O>(base_url: &str, path: &str, data: Option<I>
 
 #[derive(Serialize, Deserialize)]
 struct TelemetryMessage {
-    #[serde(rename="correlationId")]
+    #[serde(rename = "correlationId")]
     correlation_id: String,
     data: serde_json::Value,
     event: String,
-    #[serde(rename="instanceId")]
+    #[serde(rename = "instanceId")]
     instance_id: String,
-    page: Option<String>
+    page: Option<String>,
 }
 
 #[derive(Clone)]
@@ -398,7 +514,7 @@ struct Service {
     index: Rc<Index>,
     inference_server_config: Rc<InferenceServerConfig>,
     config: Rc<ServerConfig>,
-    telemetry_channel: std::sync::mpsc::Sender<TelemetryMessage>
+    telemetry_channel: std::sync::mpsc::Sender<TelemetryMessage>,
 }
 
 impl hyper::service::Service<Request<Incoming>> for Service {
@@ -414,17 +530,23 @@ impl hyper::service::Service<Request<Incoming>> for Service {
 
         Box::pin(async move {
             let mut body = match (req.method(), req.uri().path()) {
-                (&Method::GET, "/") => Response::new(Full::new(Bytes::from(serde_json::to_vec(&FrontendInit {
-                    n_total: (index.header.count - index.header.dead_count) as u64,
-                    d_emb: index.header.quantizer.n_dims,
-                    predefined_embedding_names: config.descriptor_names.clone()
-                })?))),
+                (&Method::GET, "/") => {
+                    Response::new(Full::new(Bytes::from(serde_json::to_vec(&FrontendInit {
+                        n_total: (index.header.count - index.header.dead_count) as u64,
+                        d_emb: index.header.quantizer.n_dims,
+                        predefined_embedding_names: config.descriptor_names.clone(),
+                    })?)))
+                }
                 (&Method::POST, "/") => {
-                    let msgpack = req.headers().get(hyper::header::CONTENT_TYPE)
+                    let msgpack = req
+                        .headers()
+                        .get(hyper::header::CONTENT_TYPE)
                         .and_then(|value| value.to_str().ok())
-                        .is_some_and(|value| value.split(';').next() == Some("application/msgpack"));
+                        .is_some_and(|value| {
+                            value.split(';').next() == Some("application/msgpack")
+                        });
                     let upper = req.body().size_hint().upper().unwrap_or(u64::MAX);
-                    if upper > 1<<23 {
+                    if upper > 1 << 23 {
                         let mut resp = Response::new(Full::new(Bytes::from("Body too big")));
                         *resp.status_mut() = hyper::StatusCode::PAYLOAD_TOO_LARGE;
                         return Ok(resp);
@@ -446,35 +568,53 @@ impl hyper::service::Service<Request<Incoming>> for Service {
                         },
                         |image, config| async move {
                             let image = image::load_from_memory(&image)?;
-                            Ok(serde_bytes::ByteBuf::from(resize_for_embed_sync(&*config, image)?))
+                            Ok(serde_bytes::ByteBuf::from(resize_for_embed_sync(
+                                &*config, image,
+                            )?))
                         },
                         &std::collections::HashMap::new(),
                         inference_server_config.clone(),
-                        ()
-                    ).await?;
+                        (),
+                    )
+                    .await?;
 
-                    let selected_shard = index.header.shards.iter().position_max_by_key(|x| {
-                        scale_dot_result_f64(SpatialSimilarity::dot(&x.0, &query).unwrap())
-                    }).unwrap();
+                    let selected_shard = index
+                        .header
+                        .shards
+                        .iter()
+                        .position_max_by_key(|x| {
+                            scale_dot_result_f64(SpatialSimilarity::dot(&x.0, &query).unwrap())
+                        })
+                        .unwrap();
                     let selected_start = index.header.shards[selected_shard].1;
 
                     let beamwidth = config.beam_width;
+                    // `k` is also the requested graph-search list size. Keep
+                    // the configured minimum for ordinary query recall, while
+                    // allowing reranking clients to request a broader pool.
+                    // The cap bounds both traversal work and the quadratic
+                    // exact-vector deduplication below.
+                    let max_request_k = config.search_list.max(8192);
+                    let requested_k = body.k.unwrap_or(config.search_list).clamp(1, max_request_k);
+                    let search_list = config.search_list.max(requested_k);
 
                     let mut scratch = Scratch {
                         visited: HashSet::new(),
-                        neighbour_buffer: NeighbourBuffer::new(config.search_list),
+                        neighbour_buffer: NeighbourBuffer::new(search_list),
                         neighbour_pre_buffer: Vec::new(),
                         visited_list: Vec::new(),
                         visited_adjacent: HashSet::new(),
-                        visited_embeddings: Vec::new()
+                        visited_embeddings: Vec::new(),
                     };
 
                     let mut desc = vec![0.0, 0.0, 0.0, 0.0];
 
                     for term in &body.terms {
                         if let Some(name) = &term.predefined_embedding {
-                            if let Some(index) = config.descriptor_names.iter().position(|x| x == name) {
-                                desc[index] = term.weight.unwrap_or(1.0) * 1.0/512.0;
+                            if let Some(index) =
+                                config.descriptor_names.iter().position(|x| x == name)
+                            {
+                                desc[index] = term.weight.unwrap_or(1.0) * 1.0 / 512.0;
                             }
                         }
                     }
@@ -483,14 +623,28 @@ impl hyper::service::Service<Request<Incoming>> for Service {
 
                     let query_preprocessed = index.header.quantizer.preprocess_query(&query);
 
-                    let query = query.iter().map(|x| half::f16::from_f32(*x)).collect::<Vec<f16>>();
+                    let query = query
+                        .iter()
+                        .map(|x| half::f16::from_f32(*x))
+                        .collect::<Vec<f16>>();
 
-                    let cmps_result = greedy_search(&mut scratch, selected_start, &query, &query_preprocessed, &descriptor_scales, index.clone(), false, beamwidth).await?;
+                    let cmps_result = greedy_search(
+                        &mut scratch,
+                        selected_start,
+                        &query,
+                        &query_preprocessed,
+                        &descriptor_scales,
+                        index.clone(),
+                        false,
+                        beamwidth,
+                    )
+                    .await?;
                     QUERIES_COUNTER.inc();
 
                     let n_visited = scratch.visited_list.len();
                     let n_dims = index.header.quantizer.n_dims;
-                    let visited_embeddings = std::mem::replace(&mut scratch.visited_embeddings, vec![]);
+                    let visited_embeddings =
+                        std::mem::replace(&mut scratch.visited_embeddings, vec![]);
 
                     let similarities_against_self = monoio::spawn_blocking(move || {
                         let mut similarities_against_self = vec![0.0f32; n_visited * n_visited];
@@ -512,18 +666,21 @@ impl hyper::service::Service<Request<Incoming>> for Service {
                                 0.0,
                                 similarities_against_self.as_mut_ptr(),
                                 n_visited as isize,
-                                1
+                                1,
                             );
                         }
 
                         similarities_against_self
-                    }).await.map_err(|e| anyhow::anyhow!("threadpool error: {:?}", e))?;
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("threadpool error: {:?}", e))?;
 
                     // discard anything similar to something already in list
                     let mut i = 0;
                     let mut included = bitvec::bitvec![0; n_visited];
                     scratch.visited_list.retain(|_node| {
-                        let row = &similarities_against_self[(i * n_visited)..((i + 1) * n_visited)];
+                        let row =
+                            &similarities_against_self[(i * n_visited)..((i + 1) * n_visited)];
                         let old_i = i;
                         i += 1;
                         for (other_i, similarity) in row.iter().enumerate() {
@@ -536,40 +693,80 @@ impl hyper::service::Service<Request<Incoming>> for Service {
                     });
 
                     scratch.visited_list.sort_unstable_by_key(|x| -x.score);
+                    scratch.visited_list.truncate(requested_k);
 
                     if msgpack {
                         #[derive(Serialize)]
                         struct MsgpackResult {
-                            matches: Vec<(f32, String, String, u64, Option<(u32, u32)>, Option<(Vec<f32>, Vec<u32>, u64)>, serde_bytes::ByteBuf)>,
+                            matches: Vec<(
+                                f32,
+                                String,
+                                String,
+                                u64,
+                                Option<(u32, u32)>,
+                                Option<(Vec<f32>, Vec<u32>, u64)>,
+                                serde_bytes::ByteBuf,
+                            )>,
                             formats: Vec<String>,
                             extensions: HashMap<String, String>,
                         }
 
-                        let matches = scratch.visited_list.drain(..).map(|node| {
-                            let debug = if body.debug_enabled {
-                                Some((node.scores, node.shards, node.timestamp))
-                            } else {
-                                None
-                            };
-                            ((node.score as f64 / SCALE_F64) as f32, node.image_url, String::new(), 0, Some(node.dimensions), debug, serde_bytes::ByteBuf::from(node.embedding))
-                        }).collect();
-                        let result = MsgpackResult { formats: vec![], extensions: HashMap::new(), matches };
+                        let matches = scratch
+                            .visited_list
+                            .drain(..)
+                            .map(|node| {
+                                let debug = if body.debug_enabled {
+                                    Some((node.scores, node.shards, node.timestamp))
+                                } else {
+                                    None
+                                };
+                                (
+                                    (node.score as f64 / SCALE_F64) as f32,
+                                    node.image_url,
+                                    String::new(),
+                                    0,
+                                    Some(node.dimensions),
+                                    debug,
+                                    serde_bytes::ByteBuf::from(node.embedding),
+                                )
+                            })
+                            .collect();
+                        let result = MsgpackResult {
+                            formats: vec![],
+                            extensions: HashMap::new(),
+                            matches,
+                        };
                         Response::builder()
                             .header(hyper::header::CONTENT_TYPE, "application/msgpack")
                             .body(Full::new(Bytes::from(rmp_serde::to_vec_named(&result)?)))?
                     } else {
-                        let matches = scratch.visited_list.drain(..).map(|node| {
-                            let debug = if body.debug_enabled {
-                                Some((node.scores, node.shards, node.timestamp))
-                            } else {
-                                None
-                            };
-                            ((node.score as f64 / SCALE_F64) as f32, node.image_url, String::new(), 0, Some(node.dimensions), debug)
-                        }).collect::<Vec<_>>();
-                        let result = QueryResult { formats: vec![], extensions: HashMap::new(), matches };
+                        let matches = scratch
+                            .visited_list
+                            .drain(..)
+                            .map(|node| {
+                                let debug = if body.debug_enabled {
+                                    Some((node.scores, node.shards, node.timestamp))
+                                } else {
+                                    None
+                                };
+                                (
+                                    (node.score as f64 / SCALE_F64) as f32,
+                                    node.image_url,
+                                    String::new(),
+                                    0,
+                                    Some(node.dimensions),
+                                    debug,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let result = QueryResult {
+                            formats: vec![],
+                            extensions: HashMap::new(),
+                            matches,
+                        };
                         Response::new(Full::new(Bytes::from(serde_json::to_vec(&result)?)))
                     }
-                },
+                }
                 (&Method::GET, "/metrics") => {
                     let mut buffer = Vec::new();
                     let encoder = prometheus::TextEncoder::new();
@@ -577,8 +774,9 @@ impl hyper::service::Service<Request<Incoming>> for Service {
                     encoder.encode(&metric_families, &mut buffer).unwrap();
                     Response::builder()
                         .header(hyper::header::CONTENT_TYPE, "text/plain; version=0.0.4")
-                        .body(Full::new(Bytes::from(buffer))).unwrap()
-                },
+                        .body(Full::new(Bytes::from(buffer)))
+                        .unwrap()
+                }
                 (&Method::POST, "/telemetry") => {
                     // TODO refactor
                     let upper = req.body().size_hint().upper().unwrap_or(u64::MAX);
@@ -596,23 +794,33 @@ impl hyper::service::Service<Request<Incoming>> for Service {
 
                     Response::builder()
                         .status(StatusCode::NO_CONTENT)
-                        .body(Full::new(Bytes::from(""))).unwrap()
-                }
-                (&Method::OPTIONS, "/") => {
-                    Response::builder()
-                        .status(StatusCode::NO_CONTENT)
-                        .body(Full::new(Bytes::from(""))).unwrap()
-                },
-                _ => Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(Full::new(Bytes::from("Not Found")))
+                        .body(Full::new(Bytes::from("")))
                         .unwrap()
+                }
+                (&Method::OPTIONS, "/") => Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(Full::new(Bytes::from("")))
+                    .unwrap(),
+                _ => Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Full::new(Bytes::from("Not Found")))
+                    .unwrap(),
             };
 
-            body.headers_mut().entry(hyper::header::CONTENT_TYPE).or_insert(hyper::header::HeaderValue::from_static("application/json"));
-            body.headers_mut().entry(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN).or_insert(hyper::header::HeaderValue::from_static("*"));
-            body.headers_mut().entry(hyper::header::ACCESS_CONTROL_ALLOW_METHODS).or_insert(hyper::header::HeaderValue::from_static("GET, POST, OPTIONS"));
-            body.headers_mut().entry(hyper::header::ACCESS_CONTROL_ALLOW_HEADERS).or_insert(hyper::header::HeaderValue::from_static("Content-Type"));
+            body.headers_mut()
+                .entry(hyper::header::CONTENT_TYPE)
+                .or_insert(hyper::header::HeaderValue::from_static("application/json"));
+            body.headers_mut()
+                .entry(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .or_insert(hyper::header::HeaderValue::from_static("*"));
+            body.headers_mut()
+                .entry(hyper::header::ACCESS_CONTROL_ALLOW_METHODS)
+                .or_insert(hyper::header::HeaderValue::from_static(
+                    "GET, POST, OPTIONS",
+                ));
+            body.headers_mut()
+                .entry(hyper::header::ACCESS_CONTROL_ALLOW_HEADERS)
+                .or_insert(hyper::header::HeaderValue::from_static("Content-Type"));
 
             Result::<_, anyhow::Error>::Ok(body)
         })
@@ -632,8 +840,15 @@ async fn get_backend_config(clip_server: &String) -> Result<InferenceServerConfi
 }
 
 // can't run this as an async task because monoio File API is positional writes only
-fn telemetry_handler(rx: std::sync::mpsc::Receiver<TelemetryMessage>, config: ServerConfig) -> Result<()> {
-    let mut telemetry_file = std::fs::OpenOptions::new().create(true).create(true).append(true).open(&config.telemetry_file)?;
+fn telemetry_handler(
+    rx: std::sync::mpsc::Receiver<TelemetryMessage>,
+    config: ServerConfig,
+) -> Result<()> {
+    let mut telemetry_file = std::fs::OpenOptions::new()
+        .create(true)
+        .create(true)
+        .append(true)
+        .open(&config.telemetry_file)?;
     while let Ok(message) = rx.recv() {
         telemetry_file.write_all(rmp_serde::to_vec(&message)?.as_slice())?;
     }
@@ -641,7 +856,8 @@ fn telemetry_handler(rx: std::sync::mpsc::Receiver<TelemetryMessage>, config: Se
 }
 
 async fn serve(args: Arc<CLIArguments>, index: Rc<Index>) -> Result<()> {
-    let config: ServerConfig = serde_json::from_slice(&std::fs::read(args.config_path.as_ref().unwrap())?)?;
+    let config: ServerConfig =
+        serde_json::from_slice(&std::fs::read(args.config_path.as_ref().unwrap())?)?;
 
     let (telemetry_channel, telemetry_receiver) = std::sync::mpsc::channel();
 
@@ -652,7 +868,7 @@ async fn serve(args: Arc<CLIArguments>, index: Rc<Index>) -> Result<()> {
         index,
         inference_server_config: Rc::new(get_backend_config(&config.clip_server).await?),
         config: Rc::new(config.clone()),
-        telemetry_channel
+        telemetry_channel,
     };
 
     let listener = TcpListener::bind(config.listen_address)?;
@@ -678,26 +894,34 @@ async fn serve(args: Arc<CLIArguments>, index: Rc<Index>) -> Result<()> {
 struct MemoryMaps {
     pq_codes: memmap2::Mmap,
     descriptors: memmap2::Mmap,
-    guards: Vec<region::LockGuard>
+    guards: Vec<region::LockGuard>,
 }
 
-async fn initialize_index(args: Arc<CLIArguments>, memory_maps: Arc<MemoryMaps>) -> Result<Rc<Index>> {
+async fn initialize_index(
+    args: Arc<CLIArguments>,
+    memory_maps: Arc<MemoryMaps>,
+) -> Result<Rc<Index>> {
     let index_path = PathBuf::from(&args.index_path);
-    let header: IndexHeader = rmp_serde::from_slice(&fs::read(index_path.join("index.msgpack")).await?)?;
+    let header: IndexHeader =
+        rmp_serde::from_slice(&fs::read(index_path.join("index.msgpack")).await?)?;
     let header = Rc::new(header);
     // contains graph structure, full-precision vectors, and bulk metadata
     let data_file = fs::File::open(index_path.join("index.bin")).await?;
     // contains product quantization codes
 
-
-    println!("{} items {} dead {} shards", header.count, header.dead_count, header.shards.len());
+    println!(
+        "{} items {} dead {} shards",
+        header.count,
+        header.dead_count,
+        header.shards.len()
+    );
 
     let index = Rc::new(Index {
         data_file,
         header: header.clone(),
         pq_code_size: header.quantizer.n_dims / header.quantizer.n_dims_per_code,
         n_descriptors: header.descriptor_cdfs.len(),
-        memory_maps
+        memory_maps,
     });
 
     Ok(index)
@@ -709,12 +933,16 @@ fn initialize_memory_maps(args: &CLIArguments) -> Result<MemoryMaps> {
     let pq_codes = unsafe {
         // This is unsafe because other processes could in principle edit the mmap'd file.
         // It would be annoying to do anything about this possibility, so ignore it.
-        MmapOptions::new().populate().map_copy_read_only(&pq_codes_file)?
+        MmapOptions::new()
+            .populate()
+            .map_copy_read_only(&pq_codes_file)?
     };
     // contains metadata descriptors
     let descriptors_file = std::fs::File::open(index_path.join("index.descriptor-codes.bin"))?;
     let descriptors = unsafe {
-        MmapOptions::new().populate().map_copy_read_only(&descriptors_file)?
+        MmapOptions::new()
+            .populate()
+            .map_copy_read_only(&descriptors_file)?
     };
 
     let guards = if args.lock_memory {
@@ -725,7 +953,11 @@ fn initialize_memory_maps(args: &CLIArguments) -> Result<MemoryMaps> {
         vec![]
     };
 
-    Ok(MemoryMaps { pq_codes, descriptors, guards })
+    Ok(MemoryMaps {
+        pq_codes,
+        descriptors,
+        guards,
+    })
 }
 
 fn main() -> Result<()> {
@@ -745,7 +977,8 @@ fn main() -> Result<()> {
                 let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
                     .attach_thread_pool(Box::new(pool))
                     .enable_timer()
-                    .build().unwrap();
+                    .build()
+                    .unwrap();
                 let index = rt.block_on(initialize_index(args_.clone(), maps_))?;
                 rt.block_on(serve(args_, index))
             });

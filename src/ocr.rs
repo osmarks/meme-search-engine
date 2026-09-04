@@ -6,9 +6,12 @@ use reqwest::{
     multipart::{Form, Part},
     Client,
 };
-use serde_json::Value;
-use std::{io::Cursor, time::{SystemTime, UNIX_EPOCH}};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{
+    io::Cursor,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tracing::instrument;
 
 const CALLBACK_REGEX: &str = r">AF_initDataCallback\((\{key: 'ds:1'.*?\})\);</script>";
@@ -69,10 +72,19 @@ async fn scan_image_chunk(
         "User-Agent",
         HeaderValue::from_static("Mozilla/5.0 (Linux; Android 13; RMX3771) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.144 Mobile Safari/537.36"),
     );
-    headers.insert("Cookie", HeaderValue::from_str(&format!("SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg; stcs={}", timestamp))?);
+    headers.insert(
+        "Cookie",
+        HeaderValue::from_str(&format!(
+            "SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg; stcs={}",
+            timestamp
+        ))?,
+    );
 
     let response = client
-        .post(&format!("https://lens.google.com/v3/upload?stcs={}", timestamp))
+        .post(&format!(
+            "https://lens.google.com/v3/upload?stcs={}",
+            timestamp
+        ))
         .multipart(form)
         .headers(headers)
         .send()
@@ -139,7 +151,9 @@ pub async fn scan_image(client: &Client, image: &DynamicImage) -> Result<ScanRes
 
     let (width, height, image) = if width > MAX_DIM {
         let height = ((height as f64) * (MAX_DIM as f64) / (width as f64)).round() as u32;
-        let new_image = tokio::task::block_in_place(|| image.resize_exact(MAX_DIM, height, image::imageops::FilterType::CatmullRom));
+        let new_image = tokio::task::block_in_place(|| {
+            image.resize_exact(MAX_DIM, height, image::imageops::FilterType::CatmullRom)
+        });
         (MAX_DIM, height, std::borrow::Cow::Owned(new_image))
     } else {
         (width, height, std::borrow::Cow::Borrowed(image))
